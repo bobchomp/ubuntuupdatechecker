@@ -1,0 +1,18 @@
+# Secrets - never commit real keys
+secret.env
+*.env
+!config/secret.env.example
+.env*
+
+# Real machine configs copied back into the repo by mistake
+/config/config
+/etc/
+
+# Reports / local test output
+*.html
+!docs/*.html
+report*.txt
+
+# Python
+__pycache__/
+*.pyc

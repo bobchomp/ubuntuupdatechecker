@@ -1,0 +1,58 @@
+# /etc/update-checker/config
+#
+# Per-machine settings for update-checker. INI format: "key = value".
+# Lines starting with # are comments. Lists can be comma- or space-separated.
+# Test changes with:  sudo update-checker --dry-run
+
+[general]
+# Short name shown in the email subject, e.g. "[optiplex] All up to date"
+label = myserver
+# Who gets the report (comma-separate several addresses)
+recipient = you@example.com
+# Must be an address on a domain verified in your Resend account
+from_address = info@rossmackenzie.co.uk
+from_name = Update Checker
+# yes = always email; no = only email when something needs attention
+send_when_up_to_date = yes
+
+[checks]
+# Set any of these to "no" to turn a check off. Checks for tools that are not
+# installed (snap, pro, pihole, docker) skip themselves automatically.
+apt = yes
+reboot = yes
+snap = yes
+pro = yes
+unattended_upgrades = yes
+disk = yes
+pihole = yes
+docker = yes
+
+[disk]
+mount_points = /
+# Warn when a mount point is at or above this percentage used
+warn_percent = 80
+
+[docker]
+# Extra tags to treat as "floating" (checked by comparing digests). Tags with
+# no digits at all (latest, stable, release, ...) are always floating.
+floating_tags =
+# Container names to leave out of the report entirely
+ignore_containers =
+# yes = for version-pinned containers NOT in [docker.images], still check
+# whether the registry has re-pushed that exact tag (digest changed).
+# They are still reported as "not checked" for newer versions.
+digest_check_unmapped = no
+
+[docker.images]
+# Image -> release source map for version-pinned containers.
+# Key: the image name WITHOUT tag, as shown in `docker ps`
+#      (docker.io/library/ and docker.io/ prefixes are optional).
+# Value, one of:
+#   github:OWNER/REPO     latest GitHub release (excludes pre-releases)
+#   gitlab:GROUP/PROJECT  latest GitLab release (gitlab.com, or HOST/GROUP/PROJECT)
+#   registry              newest tag in the image's own registry that has the
+#                         same shape as the running tag (v1.2.3, 1.2.3-alpine, ...)
+#   registry:OTHER/IMAGE  same, but look at another image's tags
+#   digest                treat the running tag as floating, compare digests
+#
+# ghcr.io/immich-app/immich-server = github:immich-app/immich

@@ -1,0 +1,17 @@
+[Unit]
+Description=Run update-checker every 3 days
+
+[Timer]
+# Every 3 days, counted from the last run.
+OnUnitActiveSec=3d
+# Note: systemd only honours Persistent= for OnCalendar= timers. The
+# monotonic counter above restarts at boot, so OnBootSec= is what makes a
+# run happen after the machine has been off (and shortly after install,
+# because the boot time has already passed when the timer is first started).
+Persistent=true
+OnBootSec=15min
+RandomizedDelaySec=5min
+Unit=update-checker.service
+
+[Install]
+WantedBy=timers.target

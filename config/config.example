@@ -12,7 +12,7 @@ recipient = you@example.com
 # Must be an address on a domain verified in your Resend account
 from_address = info@rossmackenzie.co.uk
 from_name = Update Checker
-# yes = always email; no = only email when something needs attention
+# yes = email every run (default); no = only email when something needs attention
 send_when_up_to_date = yes
 
 [checks]

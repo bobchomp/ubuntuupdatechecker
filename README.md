@@ -25,6 +25,10 @@ whose behaviour is set by `/etc/update-checker/config`.
 If one check fails (a registry is down, a command errors) the report says so in
 that section and the other checks still run.
 
+**Every run emails the report**, whether it's the 3-day schedule or a command
+you typed (`--dry-run` included). The email says how the run was started. Use
+`--no-email` when you only want to look at the report in the terminal.
+
 Example subjects:
 
 ```
@@ -81,13 +85,14 @@ The installer:
    (`root:root`, mode `600`). The key stays on that machine and is only ever
    sent to `api.resend.com` when a report is emailed. It is never written to
    the repo or printed;
-4. installs and starts `update-checker.timer` (systemd, runs as root);
-5. offers to do a dry run.
+4. installs and starts `update-checker.timer` (systemd, runs as root).
 
 The first report is emailed a few minutes after install, then every 3 days.
 
 Re-running `install.sh` (e.g. after a `git pull`) updates the script and the
-systemd units but **keeps your existing config and API key**. To start the
+systemd units but **keeps your existing config and API key**. (If that config
+has `send_when_up_to_date = no`, it offers to switch it to email every run.)
+To start the
 config and key over: `sudo ./install.sh --reconfigure`.
 
 #### optiplex (CasaOS + Docker, SSD + HDD)
@@ -107,11 +112,9 @@ containers listed as "not checked" to the map. See
 sudo ./install.sh --machine pihole
 ```
 
-The Docker check is disabled, the Pi-hole check is on (Tailscale and
-cloudflared are picked up automatically by the [apps check](#other-apps-tailscale-cloudflared-)), and
-`send_when_up_to_date = no` so you only get email when something needs doing.
-Change that to `yes` if you'd like a "[pihole] All up to date" every 3 days as
-proof it's alive.
+The Docker check is disabled and the Pi-hole check is on. Tailscale and
+cloudflared are picked up automatically by the [apps check](#other-apps-tailscale-cloudflared-).
+An up-to-date run still emails "[pihole] All up to date", so you know it's alive.
 
 #### droplet (DigitalOcean + Docker)
 
@@ -128,7 +131,7 @@ your containers to `[docker.images]` the same way as on optiplex.
 
 ```bash
 sudo nano /etc/update-checker/config
-sudo update-checker --dry-run      # check the result
+sudo update-checker --no-email     # check the result in the terminal, no email
 ```
 
 Changes take effect on the next run; nothing needs restarting.
@@ -139,7 +142,7 @@ label = optiplex                       # shown in the subject: [optiplex] ...
 recipient = you@example.com            # comma-separate several addresses
 from_address = info@rossmackenzie.co.uk
 from_name = Update Checker
-send_when_up_to_date = yes             # no = only email when something needs attention
+send_when_up_to_date = yes             # yes (default) = email every run; no = only when something needs attention
 
 [checks]                               # set any to "no" to turn it off
 apt = yes
@@ -165,8 +168,8 @@ digest_check_unmapped = no
 ghcr.io/immich-app/immich-server = github:immich-app/immich
 ```
 
-What counts as "up to date" (so the email can be skipped when
-`send_when_up_to_date = no`): no package/snap/Pi-hole/app/container updates, no
+Every run is emailed unless you set `send_when_up_to_date = no`, which skips
+the email when everything is up to date. "Up to date" means no package/snap/Pi-hole/app/container updates, no
 reboot needed, no disk warnings, unattended-upgrades enabled, and no failed checks.
 
 To change the Resend key or GitHub token later, either re-run
@@ -320,39 +323,55 @@ how much space `docker system prune` could free (the script never prunes).
 sudo update-checker --dry-run
 ```
 
-Runs every enabled check (including `apt-get update`) and prints the report to
-the terminal instead of emailing it. Useful options:
+Runs every enabled check (including `apt-get update`), prints the report in
+the terminal, **and emails it**, like every run. The email shows
+"Started by command: update-checker --dry-run" so you can tell it apart from
+the scheduled reports.
+
+To look at the report without sending an email, use `--no-email` instead:
+
+```bash
+sudo update-checker --no-email
+```
+
+Useful options (they work with both):
 
 ```bash
 sudo update-checker --dry-run --only docker              # just one or more checks
 sudo update-checker --dry-run --only apt,reboot,disk
 sudo update-checker --dry-run --skip-apt-update          # faster, uses existing package lists
-sudo update-checker --dry-run --html /tmp/report.html    # also save the HTML email to look at
+sudo update-checker --no-email --html /tmp/report.html   # save the HTML email to look at
 update-checker --help
 ```
 
 Check names for `--only`: `apt, reboot, snap, pro, unattended_upgrades, disk, pihole, apps, docker`.
+A run with `--only` says so in the subject, e.g. `[pihole] (apps only) All up to date`,
+so it isn't mistaken for a full report.
 
 ---
 
 ## Running a check manually
 
-Send a real report right now, exactly as the timer would:
+All of these email the report:
 
 ```bash
-sudo systemctl start update-checker.service
+sudo update-checker --dry-run                 # prints it here too
+sudo update-checker                           # prints only the log lines
+sudo systemctl start update-checker.service   # exactly as the timer runs it
 journalctl -u update-checker.service -n 50 --no-pager
 ```
 
-Or run it directly in the terminal (also emails):
+Scheduled runs and `systemctl start` are labelled "Scheduled run" in the
+email. Runs from the command line are labelled "Started by command" and show
+the command.
 
-```bash
-sudo update-checker
-```
+Run it with `sudo`: the API key file is readable by root only, so without
+`sudo` the email can't be sent (the report is still printed).
 
-Exit codes: `0` OK (sent, or skipped because everything is up to date),
-`1` email failed, `2` missing API key or recipient. If sending fails the full
-text report is written to the log so it isn't lost.
+Exit codes: `0` OK (sent, or skipped because `send_when_up_to_date = no` and
+everything is up to date), `1` email failed, `2` missing API key or recipient.
+If the email can't be sent, the full text report is printed (and so kept in
+the log).
 
 ---
 

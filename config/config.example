@@ -25,12 +25,26 @@ pro = yes
 unattended_upgrades = yes
 disk = yes
 pihole = yes
+apps = yes
 docker = yes
 
 [disk]
 mount_points = /
 # Warn when a mount point is at or above this percentage used
 warn_percent = 80
+
+[apps]
+# Other software installed directly on this machine (not in Docker).
+#   name = release source [| version command]
+# "name" is the apt package name and/or the command on PATH. The installed
+# version comes from dpkg, else from "NAME --version" / "NAME version", or
+# from the command after "|" if given. Sources as in [docker.images]:
+# github:OWNER/REPO or gitlab:GROUP/PROJECT.
+# If the app comes from an apt repo (e.g. Tailscale's), apt updates are shown
+# under System packages and not counted twice.
+# tailscale = github:tailscale/tailscale
+# cloudflared = github:cloudflare/cloudflared
+# myapp = github:owner/myapp | /opt/myapp/bin/myapp --version
 
 [docker]
 # Extra tags to treat as "floating" (checked by comparing digests). Tags with

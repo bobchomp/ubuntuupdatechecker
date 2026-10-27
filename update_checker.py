@@ -2,7 +2,7 @@
 """update-checker: report-only update checker for Ubuntu Server machines.
 
 Runs a set of checks (apt, reboot, snaps, Ubuntu Pro, unattended-upgrades,
-disk space, Pi-hole, Docker containers) and emails one HTML report via the
+disk space, Pi-hole, other apps, Docker containers) and emails one HTML report via the
 Resend HTTPS API. It never installs, upgrades, restarts or removes anything;
 the only state-changing command it runs is `apt-get update`, which refreshes
 the package lists.
@@ -19,6 +19,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -33,7 +34,7 @@ DEFAULT_SECRETS = "/etc/update-checker/secret.env"
 USER_AGENT = "update-checker/%s (+https://github.com/bobchomp/ubuntuupdatechecker)" % VERSION
 HTTP_TIMEOUT = 20
 
-CHECK_ORDER = ["apt", "reboot", "snap", "pro", "unattended_upgrades", "disk", "pihole", "docker"]
+CHECK_ORDER = ["apt", "reboot", "snap", "pro", "unattended_upgrades", "disk", "pihole", "apps", "docker"]
 
 # Tags treated as "floating" (compared by digest) in addition to any tag that
 # contains no digits at all. Extend per machine with [docker] floating_tags.
@@ -109,6 +110,14 @@ class Config:
                     log("config: ignoring invalid image name in [docker.images]: %s" % key)
                     continue
                 self.image_sources[ref["name"]] = value
+
+        # app name -> (release source, optional version command)
+        self.apps = {}
+        if cp.has_section("apps"):
+            for name, value in cp.items("apps"):
+                source, _, command = value.partition("|")
+                if source.strip():
+                    self.apps[name] = (source.strip(), command.strip() or None)
 
     def get(self, section, key, default):
         try:
@@ -1021,25 +1030,23 @@ class Registry:
 # --------------------------------------------------------------------------
 
 class ReleaseSources:
-    def __init__(self, registry, github_token=None):
-        self.registry = registry
+    def __init__(self, github_token=None):
         self.github_token = github_token
         self.cache = {}
 
-    def latest(self, source, image):
+    def latest(self, source):
         """Return the latest release tag for a source spec, cached."""
-        key = (source, image["name"])
-        if key not in self.cache:
+        if source not in self.cache:
             try:
-                self.cache[key] = ("ok", self._latest(source, image))
+                self.cache[source] = ("ok", self._latest(source))
             except Exception as exc:  # cache failures too, so one bad source is reported once
-                self.cache[key] = ("error", str(exc))
-        status, value = self.cache[key]
+                self.cache[source] = ("error", str(exc))
+        status, value = self.cache[source]
         if status == "error":
             raise RuntimeError(value)
         return value
 
-    def _latest(self, source, image):
+    def _latest(self, source):
         kind, _, arg = source.partition(":")
         kind = kind.strip().lower()
         arg = arg.strip()
@@ -1081,7 +1088,165 @@ class ReleaseSources:
 
 
 # --------------------------------------------------------------------------
-# Check 8: Docker
+# Check 8: other apps (Tailscale, cloudflared, ...)
+# --------------------------------------------------------------------------
+
+def parse_apt_policy(text):
+    """`apt-cache policy PKG` -> (installed, candidate, from_repo). from_repo is
+    True when some version comes from a configured apt source, i.e. apt itself
+    will offer updates for the package."""
+    installed = candidate = None
+    from_repo = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Installed:"):
+            installed = line.split(":", 1)[1].strip()
+        elif line.startswith("Candidate:"):
+            candidate = line.split(":", 1)[1].strip()
+        elif re.match(r"^-?\d+\s+\S", line) and "/var/lib/dpkg/status" not in line:
+            from_repo = True
+    return (None if installed in (None, "(none)") else installed,
+            None if candidate in (None, "(none)") else candidate,
+            from_repo)
+
+
+def extract_version(text):
+    """First dotted version in command output ('cloudflared version 2024.10.1
+    (built ...)' -> '2024.10.1'), falling back to a bare number."""
+    m = re.search(r"\d+(?:\.\d+)+", text) or re.search(r"\d+", text)
+    return m.group(0) if m else None
+
+
+def app_installed_version(name, command):
+    """Return (version, how) or (None, reason)."""
+    if command:
+        rc, out, err = run(shlex.split(command), timeout=30)
+        version = extract_version(out) or extract_version(err)
+        if rc != 0 or not version:
+            raise RuntimeError("version command '%s' failed (exit %s)" % (command, rc))
+        return version, "command"
+    rc, out, _ = run(["dpkg-query", "-W", "-f=${Status}\t${Version}", name], timeout=30)
+    if rc == 0 and "\t" in out:
+        status, version = out.split("\t", 1)
+        if status.strip().endswith(" installed") and version.strip():
+            return version.strip(), "dpkg"
+    path = shutil.which(name)
+    if not path:
+        return None, "not installed"
+    # Only ask for the version: never run a binary with arguments that could
+    # start or change anything.
+    for flag in ("--version", "version"):
+        try:
+            rc, out, err = run([path, flag], timeout=15)
+        except RuntimeError:
+            continue
+        version = extract_version(out) or extract_version(err)
+        if rc == 0 and version:
+            return version, path
+    raise RuntimeError("could not read the version of %s; add a version command, e.g. "
+                       "'%s = SOURCE | %s --version'" % (path, name, name))
+
+
+def deb_upstream(version):
+    """Drop a Debian epoch ('1:2.3-1' -> '2.3-1') before comparing."""
+    return re.sub(r"^\d+:", "", version or "")
+
+
+def check_apps(cfg, args, secrets):
+    r = CheckResult("apps", "Other apps")
+    if not cfg.apps:
+        return skipped(r, "no apps listed in [apps]")
+    sources = ReleaseSources(secrets.get("GITHUB_TOKEN"))
+    rows, levels = [], []
+    counts = {"outdated": 0, "apt": 0, "ok": 0, "missing": 0, "error": 0}
+
+    for name in sorted(cfg.apps):
+        source, command = cfg.apps[name]
+        try:
+            installed, how = app_installed_version(name, command)
+        except Exception as exc:
+            rows.append([name, "?", "-", source, "check failed: %s" % exc])
+            levels.append("error")
+            counts["error"] += 1
+            continue
+        if installed is None:
+            rows.append([name, "-", "-", source, "not installed on this machine"])
+            levels.append(None)
+            counts["missing"] += 1
+            continue
+
+        apt_candidate, apt_repo = None, False
+        if how == "dpkg":
+            try:
+                rc, out, _ = run(["apt-cache", "policy", name], timeout=60)
+                if rc == 0:
+                    _, apt_candidate, apt_repo = parse_apt_policy(out)
+                if apt_candidate and apt_candidate != installed:
+                    rc, _, _ = run(["dpkg", "--compare-versions", apt_candidate, "gt", installed], timeout=30)
+                    if rc != 0:
+                        apt_candidate = None    # repo only has the same or an older version
+                else:
+                    apt_candidate = None
+            except RuntimeError:
+                pass
+
+        try:
+            latest = sources.latest(source)
+            cmp = cmp_versions(deb_upstream(installed), latest)
+        except ValueError:
+            rows.append([name, installed, latest, source, "cannot compare versions"])
+            levels.append("error")
+            counts["error"] += 1
+            continue
+        except Exception as exc:
+            rows.append([name, installed, "?", source, "check failed: %s" % exc])
+            levels.append("error")
+            counts["error"] += 1
+            continue
+
+        if apt_repo and apt_candidate:
+            # apt will offer it; the System packages section already counts it
+            note, level, key = "update to %s available via apt (see System packages)" % apt_candidate, "update", "apt"
+        elif cmp < 0 and apt_repo:
+            note, level, key = "released, not yet in the apt repo; apt will offer it when it is", None, "ok"
+        elif cmp < 0:
+            note, level, key = "update available (installed manually, apt won't update it)" \
+                if how == "dpkg" else "update available", "update", "outdated"
+        else:
+            note, level, key = "up to date", None, "ok"
+        if how == "dpkg":
+            how = "apt repo" if apt_repo else "manual .deb"
+        rows.append([name, installed, latest, "%s (%s)" % (source, how), note])
+        levels.append(level)
+        counts[key] += 1
+
+    rank = {"update": 0, "error": 1}
+    order = sorted(range(len(rows)), key=lambda i: rank.get(levels[i], 2))
+    r.add_table(["App", "Installed", "Latest release", "Source (installed via)", "Status"],
+                [rows[i] for i in order], [levels[i] for i in order])
+
+    bits = []
+    if counts["outdated"]:
+        bits.append("%d update%s available" % (counts["outdated"], "" if counts["outdated"] == 1 else "s"))
+        r.raise_status("update")
+        r.subject.append(plural(counts["outdated"], "app update"))
+    if counts["apt"]:
+        bits.append("%d updatable via apt" % counts["apt"])
+        r.raise_status("update")
+    if counts["ok"]:
+        bits.append("%d up to date" % counts["ok"])
+    if counts["missing"]:
+        bits.append("%d not installed" % counts["missing"])
+    if counts["error"]:
+        bits.append(plural(counts["error"], "check error"))
+        r.raise_status("warn")
+        r.subject.append(plural(counts["error"], "app check") + " failed")
+    r.summary = ", ".join(bits)
+    return r
+
+
+# --------------------------------------------------------------------------
+# Check 9: Docker
 # --------------------------------------------------------------------------
 
 def docker_json_lines(text):
@@ -1127,7 +1292,7 @@ def check_docker(cfg, args, secrets):
                 images[img["Id"]] = img
 
     registry = Registry()
-    sources = ReleaseSources(registry, secrets.get("GITHUB_TOKEN"))
+    sources = ReleaseSources(secrets.get("GITHUB_TOKEN"))
     digest_cache = {}
     tag_cache = {}
 
@@ -1290,7 +1455,7 @@ def evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tag
         current = tag
     elif label_version and version_tuple(label_version):
         current = label_version
-    latest = sources.latest(source, ref)
+    latest = sources.latest(source)
     if current is None:
         status, _, note = digest_compare("floating tag, compared digest; ")
         return status, latest, note + " (latest release %s)" % latest
@@ -1332,7 +1497,7 @@ def send_resend(api_key, sender, recipients, subject, html_body, text_body):
 # --------------------------------------------------------------------------
 
 def build_subject(label, results):
-    order = {"apt": 10, "snap": 20, "docker": 30, "pihole": 40, "reboot": 50, "disk": 60,
+    order = {"apt": 10, "snap": 20, "docker": 30, "apps": 35, "pihole": 40, "reboot": 50, "disk": 60,
              "unattended_upgrades": 70, "pro": 80}
     parts = []
     for res in sorted(results, key=lambda r: order.get(r.key, 90)):
@@ -1352,10 +1517,12 @@ def run_checks(cfg, args, secrets):
         "unattended_upgrades": lambda: check_unattended(cfg, args),
         "disk": lambda: check_disk(cfg, args),
         "pihole": lambda: check_pihole(cfg, args),
+        "apps": lambda: check_apps(cfg, args, secrets),
         "docker": lambda: check_docker(cfg, args, secrets),
     }
     titles = {"apt": "System packages", "reboot": "Reboot required", "snap": "Snaps", "pro": "Ubuntu Pro",
               "unattended_upgrades": "Unattended upgrades", "disk": "Disk space", "pihole": "Pi-hole",
+              "apps": "Other apps",
               "docker": "Docker containers"}
     only = set(split_list(args.only)) if args.only else None
     results = []

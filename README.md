@@ -19,6 +19,7 @@ whose behaviour is set by `/etc/update-checker/config`.
 | Unattended upgrades | installed? `APT::Periodic` settings, apt-daily timers, last run. Warns if off |
 | Disk space | usage per mount point, warning at a threshold (default 80%); flags a data disk that isn't mounted |
 | Pi-hole | core / FTL / web versions from `pihole -v` (skipped if Pi-hole isn't installed) |
+| Other apps | apps installed outside Docker (Tailscale, cloudflared, ...): installed version vs latest GitHub/GitLab release |
 | Docker | every running container: name, image, tag, latest version, status; plus `docker system df` reclaimable space |
 
 If one check fails (a registry is down, a command errors) the report says so in
@@ -37,6 +38,7 @@ Example subjects:
 
 - [Install](#install) (optiplex, pihole, droplet)
 - [Editing the config](#editing-the-config)
+- [Other apps (Tailscale, cloudflared, ...)](#other-apps-tailscale-cloudflared-)
 - [Docker: the image → release-source map](#docker-the-image--release-source-map)
 - [Testing with --dry-run](#testing-with---dry-run)
 - [Running a check manually](#running-a-check-manually)
@@ -55,9 +57,11 @@ Example subjects:
    `info@rossmackenzie.co.uk`, so `rossmackenzie.co.uk` must be verified).
 2. Create an API key at <https://resend.com/api-keys> with **Sending access**.
    Keep it handy; the installer asks for it on each machine.
-3. Optional: a GitHub personal access token (no scopes needed) to raise the
-   GitHub API limit from 60 to 5000 requests/hour. Only useful if you map many
-   containers to `github:` sources.
+3. Optional: a GitHub token to raise the GitHub API limit from 60 to 5000
+   requests/hour for `github:` sources. It needs no permissions: create a
+   fine-grained token (Settings → Developer settings → Personal access tokens)
+   with repository access "Public repositories" and nothing else, or a classic
+   token with no scopes ticked. One token can be used on all machines.
 
 ### On each machine
 
@@ -103,7 +107,9 @@ containers listed as "not checked" to the map. See
 sudo ./install.sh --machine pihole
 ```
 
-The Docker check is disabled, the Pi-hole check is on, and
+The Docker check is disabled, the Pi-hole check is on, Tailscale and
+cloudflared are listed under `[apps]` (delete either line if it isn't
+installed, or leave it: it just shows as "not installed"), and
 `send_when_up_to_date = no` so you only get email when something needs doing.
 Change that to `yes` if you'd like a "[pihole] All up to date" every 3 days as
 proof it's alive.
@@ -144,6 +150,7 @@ pro = yes
 unattended_upgrades = yes
 disk = yes
 pihole = no
+apps = yes
 docker = yes
 
 [disk]
@@ -160,7 +167,7 @@ ghcr.io/immich-app/immich-server = github:immich-app/immich
 ```
 
 What counts as "up to date" (so the email can be skipped when
-`send_when_up_to_date = no`): no package/snap/Pi-hole/container updates, no
+`send_when_up_to_date = no`): no package/snap/Pi-hole/app/container updates, no
 reboot needed, no disk warnings, unattended-upgrades enabled, and no failed checks.
 
 To change the Resend key or GitHub token later, either re-run
@@ -170,6 +177,52 @@ To change the Resend key or GitHub token later, either re-run
 sudo nano /etc/update-checker/secret.env   # RESEND_API_KEY=re_... / GITHUB_TOKEN=...
 sudo chmod 600 /etc/update-checker/secret.env
 ```
+
+---
+
+## Other apps (Tailscale, cloudflared, ...)
+
+For software installed directly on the machine rather than in Docker, list it
+under `[apps]`:
+
+```ini
+[apps]
+tailscale = github:tailscale/tailscale
+cloudflared = github:cloudflare/cloudflared
+```
+
+Format: `name = source`, optionally followed by `| version command`.
+
+- **name** is the apt package name and/or the command on the PATH.
+- **source** is `github:OWNER/REPO` or `gitlab:GROUP/PROJECT`, as for
+  [Docker](#sources).
+
+The installed version is read, in this order, from:
+
+1. the command after `|`, if you gave one;
+2. dpkg, if a package called `name` is installed;
+3. `name --version`, then `name version`.
+
+The checker only ever asks programs for their version. It never runs them any
+other way.
+
+The report also says *how* each app was installed, because that decides what
+updates it:
+
+| Installed via | What the report says |
+|---|---|
+| **apt repo** (e.g. Tailscale's install script adds `pkgs.tailscale.com`) | `apt upgrade` will update it, so a pending update is already listed under **System packages**. The app row says "available via apt" and isn't counted twice in the subject. If GitHub has a release the repo doesn't have yet, it says so for information only. |
+| **manual .deb** (e.g. cloudflared installed with `dpkg -i` as Cloudflare's tunnel setup page shows) | apt will **never** update it. An update shows as "installed manually, apt won't update it" and counts as an app update in the subject. |
+| **binary** on the PATH | Same as manual .deb. |
+
+If an app's version can't be read automatically, give the command:
+
+```ini
+myapp = github:owner/myapp | /opt/myapp/bin/myapp --version
+```
+
+The first version-looking string in its output (e.g. `2024.10.1`) is used.
+Test with `sudo update-checker --dry-run --only apps`.
 
 ---
 
@@ -254,7 +307,7 @@ sudo update-checker --dry-run --html /tmp/report.html    # also save the HTML em
 update-checker --help
 ```
 
-Check names for `--only`: `apt, reboot, snap, pro, unattended_upgrades, disk, pihole, docker`.
+Check names for `--only`: `apt, reboot, snap, pro, unattended_upgrades, disk, pihole, apps, docker`.
 
 ---
 

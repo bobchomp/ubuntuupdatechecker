@@ -263,7 +263,7 @@ lscr.io/linuxserver/sonarr = registry
                 mock.patch.object(u.Registry, "_load_docker_auths", return_value={}), \
                 mock.patch.object(u.Registry, "manifest_digest", fake_digest), \
                 mock.patch.object(u.Registry, "list_tags", lambda s, reg, repo: REMOTE_TAGS[(reg, repo)]), \
-                mock.patch.object(u.ReleaseSources, "_latest", lambda s, src, img: RELEASES[src]):
+                mock.patch.object(u.ReleaseSources, "_latest", lambda s, src: RELEASES[src]):
             return u.check_docker(cfg, Args(), {})
 
     def test_statuses(self):
@@ -304,6 +304,135 @@ lscr.io/linuxserver/sonarr = registry
                 mock.patch.object(u, "run", return_value=(1, "", "Cannot connect")):
             r = u.check_docker(cfg, Args(), {})
         self.assertEqual(r.status, "skipped")
+
+
+# ---------------------------------------------------------------- Apps
+
+POLICY_REPO_NEWER = """tailscale:
+  Installed: 1.76.6
+  Candidate: 1.78.1
+  Version table:
+     1.78.1 500
+        500 https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages
+ *** 1.76.6 100
+        100 /var/lib/dpkg/status
+"""
+POLICY_REPO_SAME = """tailscale:
+  Installed: 1.76.6
+  Candidate: 1.76.6
+  Version table:
+ *** 1.76.6 500
+        500 https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages
+        100 /var/lib/dpkg/status
+"""
+POLICY_LOCAL_ONLY = """cloudflared:
+  Installed: 2024.10.1
+  Candidate: 2024.10.1
+  Version table:
+ *** 2024.10.1 100
+        100 /var/lib/dpkg/status
+"""
+
+
+def apps_fake_run(policies, dpkg_versions, binaries=None):
+    binaries = binaries or {}
+
+    def fake(cmd, timeout=120, env_extra=None):
+        if cmd[0] == "dpkg-query":
+            name = cmd[-1]
+            if name in dpkg_versions:
+                return 0, "install ok installed\t%s" % dpkg_versions[name], ""
+            return 1, "", "no packages found"
+        if cmd[:2] == ["apt-cache", "policy"]:
+            return 0, policies[cmd[2]], ""
+        if cmd[:2] == ["dpkg", "--compare-versions"]:
+            return (0 if u.cmp_versions(cmd[2], cmd[4]) > 0 else 1), "", ""
+        if cmd[0] in binaries:
+            return binaries[cmd[0]](cmd)
+        raise AssertionError(cmd)
+    return fake
+
+
+class AppsTests(unittest.TestCase):
+    def test_parse_apt_policy(self):
+        self.assertEqual(u.parse_apt_policy(POLICY_REPO_NEWER), ("1.76.6", "1.78.1", True))
+        self.assertEqual(u.parse_apt_policy(POLICY_LOCAL_ONLY), ("2024.10.1", "2024.10.1", False))
+
+    def test_extract_version(self):
+        self.assertEqual(u.extract_version("cloudflared version 2024.10.1 (built 2024-10-02-1234 UTC)"),
+                         "2024.10.1")
+        self.assertEqual(u.extract_version("1.76.6\n  go version: go1.23.1"), "1.76.6")
+        self.assertIsNone(u.extract_version("no digits"))
+
+    def test_config(self):
+        cfg = make_cfg("[apps]\ntailscale = github:tailscale/tailscale\n"
+                       "myapp = gitlab:me/myapp | /opt/myapp/bin/myapp --version\n")
+        self.assertEqual(cfg.apps["tailscale"], ("github:tailscale/tailscale", None))
+        self.assertEqual(cfg.apps["myapp"], ("gitlab:me/myapp", "/opt/myapp/bin/myapp --version"))
+        pihole = u.Config(os.path.join(ROOT, "examples", "pihole.conf"))
+        self.assertIn("cloudflared", pihole.apps)
+        self.assertIn("tailscale", pihole.apps)
+
+    def run_apps(self, cfg_text, fake, releases):
+        cfg = make_cfg(cfg_text)
+        with mock.patch.object(u, "run", side_effect=fake), \
+                mock.patch.object(u.shutil, "which", side_effect=lambda n: "/opt/bin/" + n if n == "mytool" else None), \
+                mock.patch.object(u.ReleaseSources, "_latest", lambda s, src: releases[src]):
+            r = u.check_apps(cfg, Args(), {})
+        return r, {row[0]: row for row in r.blocks[0][2]}
+
+    def test_apt_repo_update_not_double_counted(self):
+        r, rows = self.run_apps("[apps]\ntailscale = github:tailscale/tailscale\n",
+                                apps_fake_run({"tailscale": POLICY_REPO_NEWER}, {"tailscale": "1.76.6"}),
+                                {"github:tailscale/tailscale": "v1.78.1"})
+        self.assertIn("via apt", rows["tailscale"][4])
+        self.assertIn("apt repo", rows["tailscale"][3])
+        self.assertEqual(r.status, "update")
+        self.assertEqual(r.subject, [])   # already counted under System packages
+
+    def test_released_but_not_in_apt_repo_yet(self):
+        r, rows = self.run_apps("[apps]\ntailscale = github:tailscale/tailscale\n",
+                                apps_fake_run({"tailscale": POLICY_REPO_SAME}, {"tailscale": "1.76.6"}),
+                                {"github:tailscale/tailscale": "v1.78.1"})
+        self.assertIn("not yet in the apt repo", rows["tailscale"][4])
+        self.assertEqual(r.status, "ok")
+        self.assertEqual(r.subject, [])
+
+    def test_manual_deb_and_binary_and_errors(self):
+        fake = apps_fake_run(
+            {"cloudflared": POLICY_LOCAL_ONLY, "broken": POLICY_LOCAL_ONLY},
+            {"cloudflared": "2024.10.1", "broken": "1.0"},
+            {"/opt/bin/mytool": lambda cmd: (0, "mytool 3.2.1\n", ""),
+             "/srv/odd/bin/odd": lambda cmd: (0, "odd v0.9\n", "")})
+        r, rows = self.run_apps(
+            "[apps]\ncloudflared = github:cloudflare/cloudflared\nmytool = github:me/mytool\n"
+            "odd = gitlab:me/odd | /srv/odd/bin/odd --print-version\nghost = github:me/ghost\n"
+            "broken = github:me/broken\n",
+            fake, {"github:cloudflare/cloudflared": "2025.10.0", "github:me/mytool": "v3.2.1",
+                   "gitlab:me/odd": "v1.0", "github:me/broken": "x"})
+        self.assertIn("installed manually", rows["cloudflared"][4])
+        self.assertIn("manual .deb", rows["cloudflared"][3])
+        self.assertEqual(rows["mytool"][4], "up to date")
+        self.assertEqual(rows["odd"][1], "0.9")                 # from the configured command
+        self.assertIn("update available", rows["odd"][4])
+        self.assertIn("not installed", rows["ghost"][4])
+        self.assertIn("cannot compare", rows["broken"][4])     # release tag "x" has no version
+        self.assertEqual(r.subject, ["2 app updates", "1 app check failed"])
+
+    def test_release_lookup_failure(self):
+        def boom(s, src):
+            raise RuntimeError("GitHub API rate limit reached")
+        cfg = make_cfg("[apps]\ncloudflared = github:cloudflare/cloudflared\n")
+        fake = apps_fake_run({"cloudflared": POLICY_LOCAL_ONLY}, {"cloudflared": "2024.10.1"})
+        with mock.patch.object(u, "run", side_effect=fake), \
+                mock.patch.object(u.ReleaseSources, "_latest", boom):
+            r = u.check_apps(cfg, Args(), {})
+        self.assertEqual(r.status, "warn")
+        self.assertIn("rate limit", r.blocks[0][2][0][4])
+        self.assertEqual(r.subject, ["1 app check failed"])
+
+    def test_no_apps_configured(self):
+        self.assertEqual(u.check_apps(make_cfg("[general]\n"), Args(), {}).status, "skipped")
 
 
 class EmailTests(unittest.TestCase):

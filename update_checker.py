@@ -111,10 +111,15 @@ class Config:
                     continue
                 self.image_sources[ref["name"]] = value
 
-        # app name -> (release source, optional version command)
+        # app name -> (release source, optional version command). Two
+        # reserved keys: auto_detect (yes/no) and ignore (list of names).
         self.apps = {}
+        self.apps_auto_detect = self.getbool("apps", "auto_detect", True)
+        self.apps_ignore = set(split_list(self.get("apps", "ignore", "")))
         if cp.has_section("apps"):
             for name, value in cp.items("apps"):
+                if name in ("auto_detect", "ignore"):
+                    continue
                 source, _, command = value.partition("|")
                 if source.strip():
                     self.apps[name] = (source.strip(), command.strip() or None)
@@ -1091,23 +1096,71 @@ class ReleaseSources:
 # Check 8: other apps (Tailscale, cloudflared, ...)
 # --------------------------------------------------------------------------
 
+# Well-known apps, checked automatically wherever they're installed (unless
+# [apps] auto_detect = no). name -> (release source, command that only prints
+# the version). Entries in the config's [apps] section override these.
+KNOWN_APPS = {
+    "tailscale": ("github:tailscale/tailscale", "tailscale version"),
+    "cloudflared": ("github:cloudflare/cloudflared", "cloudflared --version"),
+    "rclone": ("github:rclone/rclone", "rclone version"),
+    "restic": ("github:restic/restic", "restic version"),
+    "caddy": ("github:caddyserver/caddy", "caddy version"),
+    "netbird": ("github:netbirdio/netbird", "netbird version"),
+    "node_exporter": ("github:prometheus/node_exporter", "node_exporter --version"),
+    "lazydocker": ("github:jesseduffield/lazydocker", "lazydocker --version"),
+}
+
+# "500 https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages"
+POLICY_SOURCE_RE = re.compile(r"^\s*-?\d+\s+(\S*/.*\S)\s*$")
+
+
 def parse_apt_policy(text):
-    """`apt-cache policy PKG` -> (installed, candidate, from_repo). from_repo is
-    True when some version comes from a configured apt source, i.e. apt itself
-    will offer updates for the package."""
+    """`apt-cache policy PKG` -> (installed, candidate, sources) where sources
+    are the apt sources (other than the local dpkg status file) that offer
+    some version of the package."""
     installed = candidate = None
-    from_repo = False
+    sources = []
     for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("Installed:"):
-            installed = line.split(":", 1)[1].strip()
-        elif line.startswith("Candidate:"):
-            candidate = line.split(":", 1)[1].strip()
-        elif re.match(r"^-?\d+\s+\S", line) and "/var/lib/dpkg/status" not in line:
-            from_repo = True
+        stripped = line.strip()
+        if stripped.startswith("Installed:"):
+            installed = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Candidate:"):
+            candidate = stripped.split(":", 1)[1].strip()
+        else:
+            m = POLICY_SOURCE_RE.match(line)
+            if m and "/var/lib/dpkg/status" not in line and m.group(1) not in sources:
+                sources.append(m.group(1))
     return (None if installed in (None, "(none)") else installed,
             None if candidate in (None, "(none)") else candidate,
-            from_repo)
+            sources)
+
+
+def parse_ubuntu_sources(text):
+    """`apt-cache policy` (no args) -> set of apt sources published by Ubuntu
+    itself (o=Ubuntu, o=UbuntuESM...), whichever mirror they come from."""
+    ubuntu, current = set(), None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("release "):
+            if current and re.search(r"(^|[ ,])o=Ubuntu", stripped[len("release "):]):
+                ubuntu.add(current)
+            continue
+        m = POLICY_SOURCE_RE.match(line)
+        current = m.group(1) if m and "->" not in line else None
+    return ubuntu
+
+
+def parse_local_packages(text):
+    """`apt list --installed` -> names of packages no apt source provides
+    (marked [installed,local]: installed from a .deb, or their repo is gone)."""
+    names = []
+    for m in re.finditer(r"^([^/\s]+)/\S+\s+\S+\s+\S+\s+\[([^\]]*)\]", text, re.M):
+        if "local" in m.group(2).split(","):
+            names.append(m.group(1))
+    return names
+
+
+KERNEL_RE = re.compile(r"^linux($|-)")
 
 
 def extract_version(text):
@@ -1117,34 +1170,51 @@ def extract_version(text):
     return m.group(0) if m else None
 
 
-def app_installed_version(name, command):
-    """Return (version, how) or (None, reason)."""
-    if command:
-        rc, out, err = run(shlex.split(command), timeout=30)
-        version = extract_version(out) or extract_version(err)
-        if rc != 0 or not version:
-            raise RuntimeError("version command '%s' failed (exit %s)" % (command, rc))
-        return version, "command"
+def dpkg_installed_version(name):
     rc, out, _ = run(["dpkg-query", "-W", "-f=${Status}\t${Version}", name], timeout=30)
     if rc == 0 and "\t" in out:
         status, version = out.split("\t", 1)
         if status.strip().endswith(" installed") and version.strip():
-            return version.strip(), "dpkg"
-    path = shutil.which(name)
-    if not path:
-        return None, "not installed"
-    # Only ask for the version: never run a binary with arguments that could
-    # start or change anything.
-    for flag in ("--version", "version"):
+            return version.strip()
+    return None
+
+
+def run_version_command(command):
+    """Run a version command; None if its program isn't installed."""
+    argv = shlex.split(command)
+    path = argv[0] if "/" in argv[0] else shutil.which(argv[0])
+    if not path or not os.path.exists(path):
+        return None
+    rc, out, err = run([path] + argv[1:], timeout=30)
+    version = extract_version(out) or extract_version(err)
+    if rc != 0 or not version:
+        raise RuntimeError("'%s' did not print a version (exit %s)" % (command, rc))
+    return version
+
+
+def app_installed_version(name, command, command_first):
+    """Return (version, how) with how in dpkg/binary, or (None, None) if the
+    app isn't installed. Programs are only ever run with a version command:
+    a configured/known one, or plain --version."""
+    if command and command_first:
+        version = run_version_command(command)
+        if version:
+            return version, "binary"
+    version = dpkg_installed_version(name)
+    if version:
+        return version, "dpkg"
+    if not command:
+        if not shutil.which(name):
+            return None, None
+        command = "%s --version" % shlex.quote(name)
         try:
-            rc, out, err = run([path, flag], timeout=15)
+            version = run_version_command(command)
         except RuntimeError:
-            continue
-        version = extract_version(out) or extract_version(err)
-        if rc == 0 and version:
-            return version, path
-    raise RuntimeError("could not read the version of %s; add a version command, e.g. "
-                       "'%s = SOURCE | %s --version'" % (path, name, name))
+            raise RuntimeError("could not read its version with --version; add the right command, "
+                               "e.g. '%s = SOURCE | %s -v'" % (name, name))
+    else:
+        version = run_version_command(command)
+    return (version, "binary") if version else (None, None)
 
 
 def deb_upstream(version):
@@ -1154,76 +1224,141 @@ def deb_upstream(version):
 
 def check_apps(cfg, args, secrets):
     r = CheckResult("apps", "Other apps")
-    if not cfg.apps:
-        return skipped(r, "no apps listed in [apps]")
+    # name -> (source, command, from_config, command_first). A configured
+    # command is tried first; otherwise dpkg first, then the known command.
+    apps = {}
+    if cfg.apps_auto_detect:
+        for name, (source, command) in KNOWN_APPS.items():
+            apps[name] = (source, command, False, False)
+    for name, (source, command) in cfg.apps.items():
+        known_command = KNOWN_APPS.get(name, (None, None))[1]
+        apps[name] = (source, command or known_command, True, bool(command))
+    for name in cfg.apps_ignore:
+        apps.pop(name, None)
+    if not apps and not cfg.apps_auto_detect:
+        return skipped(r, "auto_detect is off and no apps are listed in [apps]")
+
+    have_apt = bool(shutil.which("apt-cache"))
+    ubuntu_srcs = set()
+    if have_apt:
+        try:
+            rc, out, _ = run(["apt-cache", "policy"], timeout=60)
+            if rc == 0:
+                ubuntu_srcs = parse_ubuntu_sources(out)
+        except RuntimeError:
+            pass
+
     sources = ReleaseSources(secrets.get("GITHUB_TOKEN"))
     rows, levels = [], []
-    counts = {"outdated": 0, "apt": 0, "ok": 0, "missing": 0, "error": 0}
+    counts = {"outdated": 0, "apt": 0, "ok": 0, "missing": 0, "error": 0, "not_checked": 0}
 
-    for name in sorted(cfg.apps):
-        source, command = cfg.apps[name]
+    def add(row, level, key):
+        rows.append(row)
+        levels.append(level)
+        counts[key] += 1
+
+    for name in sorted(apps):
+        source, command, from_config, command_first = apps[name]
+        auto = "" if from_config else ", auto-detected"
         try:
-            installed, how = app_installed_version(name, command)
+            installed, how = app_installed_version(name, command, command_first)
         except Exception as exc:
-            rows.append([name, "?", "-", source, "check failed: %s" % exc])
-            levels.append("error")
-            counts["error"] += 1
+            add([name, "?", "-", source, "check failed: %s" % exc], "error", "error")
             continue
         if installed is None:
-            rows.append([name, "-", "-", source, "not installed on this machine"])
-            levels.append(None)
-            counts["missing"] += 1
+            if from_config:
+                add([name, "-", "-", source, "not installed on this machine"], None, "missing")
             continue
 
-        apt_candidate, apt_repo = None, False
-        if how == "dpkg":
+        apt_candidate, apt_sources = None, []
+        if how == "dpkg" and have_apt:
             try:
                 rc, out, _ = run(["apt-cache", "policy", name], timeout=60)
                 if rc == 0:
-                    _, apt_candidate, apt_repo = parse_apt_policy(out)
+                    _, apt_candidate, apt_sources = parse_apt_policy(out)
                 if apt_candidate and apt_candidate != installed:
                     rc, _, _ = run(["dpkg", "--compare-versions", apt_candidate, "gt", installed], timeout=30)
                     if rc != 0:
-                        apt_candidate = None    # repo only has the same or an older version
+                        apt_candidate = None    # sources only have the same or an older version
                 else:
                     apt_candidate = None
             except RuntimeError:
                 pass
+        if not from_config and apt_sources and all(src in ubuntu_srcs for src in apt_sources):
+            continue    # Ubuntu's own package: the System packages check covers it
 
         try:
             latest = sources.latest(source)
             cmp = cmp_versions(deb_upstream(installed), latest)
         except ValueError:
-            rows.append([name, installed, latest, source, "cannot compare versions"])
-            levels.append("error")
-            counts["error"] += 1
+            add([name, installed, latest, source, "cannot compare versions"], "error", "error")
             continue
         except Exception as exc:
-            rows.append([name, installed, "?", source, "check failed: %s" % exc])
-            levels.append("error")
-            counts["error"] += 1
+            add([name, installed, "?", source, "check failed: %s" % exc], "error", "error")
             continue
 
-        if apt_repo and apt_candidate:
+        if apt_sources and apt_candidate:
             # apt will offer it; the System packages section already counts it
-            note, level, key = "update to %s available via apt (see System packages)" % apt_candidate, "update", "apt"
-        elif cmp < 0 and apt_repo:
-            note, level, key = "released, not yet in the apt repo; apt will offer it when it is", None, "ok"
+            row = (name, installed, latest, "update to %s available via apt (see System packages)" % apt_candidate)
+            level, key = "update", "apt"
+        elif cmp < 0 and apt_sources:
+            row = (name, installed, latest, "released, not yet in the apt repo; apt will offer it when it is")
+            level, key = None, "ok"
         elif cmp < 0:
-            note, level, key = "update available (installed manually, apt won't update it)" \
-                if how == "dpkg" else "update available", "update", "outdated"
+            row = (name, installed, latest, "update available (installed manually, apt won't update it)"
+                   if how == "dpkg" else "update available")
+            level, key = "update", "outdated"
         else:
-            note, level, key = "up to date", None, "ok"
+            row = (name, installed, latest, "up to date")
+            level, key = None, "ok"
         if how == "dpkg":
-            how = "apt repo" if apt_repo else "manual .deb"
-        rows.append([name, installed, latest, "%s (%s)" % (source, how), note])
-        levels.append(level)
-        counts[key] += 1
+            how = "apt repo" if apt_sources else "manual .deb"
+        add([row[0], row[1], row[2], "%s (%s%s)" % (source, how, auto), row[3]], level, key)
+
+    # Everything else apt can't update: packages no apt source provides.
+    untracked = []
+    if cfg.apps_auto_detect and have_apt:
+        try:
+            rc, out, _ = run(["apt", "list", "--installed"], timeout=120)
+            local = parse_local_packages(out) if rc == 0 else []
+            groups = {}
+            if local:
+                rc, out, _ = run(["dpkg-query", "-W", "-f=${binary:Package}\t${Package}\t${source:Package}"
+                                  "\t${Version}\n"] + local, timeout=60)
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) == 4:
+                        group = groups.setdefault(parts[2] or parts[1], [])
+                        if (parts[1], parts[3]) not in group:   # multi-arch: same package twice
+                            group.append((parts[1], parts[3]))
+            for src_name in sorted(groups):
+                pkgs = groups[src_name]
+                names = [p for p, _ in pkgs]
+                if (KERNEL_RE.match(src_name) or src_name in apps or src_name in cfg.apps_ignore
+                        or any(n in apps or n in cfg.apps_ignore for n in names)):
+                    continue
+                label = src_name if names == [src_name] else "%s (%s)" % (
+                    src_name, ", ".join(names[:3]) + (", +%d more" % (len(names) - 3) if len(names) > 3 else ""))
+                add([label, pkgs[0][1], "-", "manual .deb or removed repo",
+                     "not checked (apt can't update it)"], None, "not_checked")
+                untracked.append(src_name)
+        except RuntimeError as exc:
+            r.add_para("Could not look for manually installed packages: %s" % exc, "warn")
 
     rank = {"update": 0, "error": 1}
     order = sorted(range(len(rows)), key=lambda i: rank.get(levels[i], 2))
-    r.add_table(["App", "Installed", "Latest release", "Source (installed via)", "Status"],
-                [rows[i] for i in order], [levels[i] for i in order])
+    if rows:
+        r.add_table(["App", "Installed", "Latest release", "Source (installed via)", "Status"],
+                    [rows[i] for i in order], [levels[i] for i in order])
+    if untracked:
+        r.add_para("No apt source provides the packages marked \"not checked\" (installed from a downloaded "
+                   ".deb, or their repo was removed), so apt will never update them. To track one, add it to "
+                   "[apps] in /etc/update-checker/config; to hide them, list them under ignore:")
+        r.add_pre("[apps]\n%s\nignore = %s" % (
+            "\n".join("%s = github:OWNER/REPO" % n for n in untracked), ", ".join(untracked)))
+    if cfg.apps_auto_detect:
+        r.add_para("Checked automatically if installed: %s. Ubuntu's own packages are covered by "
+                   "System packages." % ", ".join(sorted(KNOWN_APPS)))
 
     bits = []
     if counts["outdated"]:
@@ -1235,13 +1370,15 @@ def check_apps(cfg, args, secrets):
         r.raise_status("update")
     if counts["ok"]:
         bits.append("%d up to date" % counts["ok"])
+    if counts["not_checked"]:
+        bits.append("%d not checked" % counts["not_checked"])
     if counts["missing"]:
         bits.append("%d not installed" % counts["missing"])
     if counts["error"]:
         bits.append(plural(counts["error"], "check error"))
         r.raise_status("warn")
         r.subject.append(plural(counts["error"], "app check") + " failed")
-    r.summary = ", ".join(bits)
+    r.summary = ", ".join(bits) if bits else "No third-party apps found"
     return r
 
 

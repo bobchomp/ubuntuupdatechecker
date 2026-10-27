@@ -308,23 +308,42 @@ lscr.io/linuxserver/sonarr = registry
 
 # ---------------------------------------------------------------- Apps
 
+TS_REPO = "https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages"
+DO_MIRROR = "http://mirrors.digitalocean.com/ubuntu noble/universe amd64 Packages"
+
+GLOBAL_POLICY = """Package files:
+ 100 /var/lib/dpkg/status
+     release a=now
+ 500 %s
+     release o=Tailscale,a=noble,n=noble,l=Tailscale,c=main,b=amd64
+     origin pkgs.tailscale.com
+ 500 %s
+     release v=24.04,o=Ubuntu,a=noble,n=noble,l=Ubuntu,c=universe,b=amd64
+     origin mirrors.digitalocean.com
+ 510 https://esm.ubuntu.com/apps/ubuntu noble-apps-security/main amd64 Packages
+     release v=24.04,o=UbuntuESMApps,a=noble-apps-security,n=noble,l=UbuntuESMApps,c=main,b=amd64
+     origin esm.ubuntu.com
+Pinned packages:
+     tailscale -> 1.76.6 with priority 1001
+""" % (TS_REPO, DO_MIRROR)
+
 POLICY_REPO_NEWER = """tailscale:
   Installed: 1.76.6
   Candidate: 1.78.1
   Version table:
      1.78.1 500
-        500 https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages
+        500 %s
  *** 1.76.6 100
         100 /var/lib/dpkg/status
-"""
+""" % TS_REPO
 POLICY_REPO_SAME = """tailscale:
   Installed: 1.76.6
   Candidate: 1.76.6
   Version table:
  *** 1.76.6 500
-        500 https://pkgs.tailscale.com/stable/ubuntu noble/main amd64 Packages
+        500 %s
         100 /var/lib/dpkg/status
-"""
+""" % TS_REPO
 POLICY_LOCAL_ONLY = """cloudflared:
   Installed: 2024.10.1
   Candidate: 2024.10.1
@@ -332,31 +351,96 @@ POLICY_LOCAL_ONLY = """cloudflared:
  *** 2024.10.1 100
         100 /var/lib/dpkg/status
 """
+POLICY_UBUNTU = """rclone:
+  Installed: 1.60.1+dfsg-3ubuntu0.24.04.1
+  Candidate: 1.60.1+dfsg-3ubuntu0.24.04.1
+  Version table:
+ *** 1.60.1+dfsg-3ubuntu0.24.04.1 500
+        500 %s
+        100 /var/lib/dpkg/status
+""" % DO_MIRROR
+
+APT_INSTALLED = """Listing...
+cloudflared/now 2024.10.1 amd64 [installed,local]
+libpython3.11/now 3.11.17-1+noble1 amd64 [installed,local]
+libpython3.11-dev/now 3.11.17-1+noble1 amd64 [installed,local]
+linux-image-6.8.0-40-generic/now 6.8.0-40.40 amd64 [installed,local]
+oldtool/now 0.3 all [installed,automatic,local]
+zlib1g/noble-updates,now 1:1.3.dfsg-3.1ubuntu2.3 amd64 [installed]
+"""
+# binary package -> (source package, version)
+LOCAL_DB = {"cloudflared": ("cloudflared", "2024.10.1"),
+            "libpython3.11": ("python3.11", "3.11.17-1+noble1"),
+            "libpython3.11-dev": ("python3.11", "3.11.17-1+noble1"),
+            "linux-image-6.8.0-40-generic": ("linux-signed", "6.8.0-40.40"),
+            "oldtool": ("oldtool", "0.3")}
 
 
-def apps_fake_run(policies, dpkg_versions, binaries=None):
-    binaries = binaries or {}
+class AppsEnv:
+    """Fake machine for check_apps: dpkg packages, apt policies, binaries."""
 
-    def fake(cmd, timeout=120, env_extra=None):
-        if cmd[0] == "dpkg-query":
-            name = cmd[-1]
-            if name in dpkg_versions:
-                return 0, "install ok installed\t%s" % dpkg_versions[name], ""
-            return 1, "", "no packages found"
+    def __init__(self, dpkg=None, policies=None, binaries=None, apt_installed="Listing...\n"):
+        self.dpkg = dpkg or {}                  # package -> version
+        self.policies = policies or {}          # package -> apt-cache policy text
+        self.binaries = binaries or {}          # name -> callable(argv) -> (rc, out, err)
+        self.apt_installed = apt_installed
+        self.ran = []
+
+    def which(self, name):
+        if name in ("apt", "apt-cache"):
+            return "/usr/bin/" + name
+        return "/usr/local/bin/" + name if name in self.binaries else None
+
+    def run(self, cmd, timeout=120, env_extra=None):
+        self.ran.append(cmd)
+        if cmd == ["apt-cache", "policy"]:
+            return 0, GLOBAL_POLICY, ""
         if cmd[:2] == ["apt-cache", "policy"]:
-            return 0, policies[cmd[2]], ""
+            return 0, self.policies[cmd[2]], ""
+        if cmd == ["apt", "list", "--installed"]:
+            return 0, self.apt_installed, ""
+        if cmd[0] == "dpkg-query" and cmd[2].startswith("-f=${Status}"):
+            if cmd[3] in self.dpkg:
+                return 0, "install ok installed\t%s" % self.dpkg[cmd[3]], ""
+            return 1, "", "no packages found"
+        if cmd[0] == "dpkg-query":
+            return 0, "".join("%s:amd64\t%s\t%s\t%s\n" % (n, n, LOCAL_DB[n][0], LOCAL_DB[n][1])
+                              for n in cmd[3:]), ""
         if cmd[:2] == ["dpkg", "--compare-versions"]:
             return (0 if u.cmp_versions(cmd[2], cmd[4]) > 0 else 1), "", ""
-        if cmd[0] in binaries:
-            return binaries[cmd[0]](cmd)
+        name = os.path.basename(cmd[0])
+        if name in self.binaries:
+            return self.binaries[name](cmd)
         raise AssertionError(cmd)
-    return fake
 
 
-class AppsTests(unittest.TestCase):
+def run_apps(cfg_text, env, releases):
+    cfg = make_cfg(cfg_text)
+    with mock.patch.object(u, "run", side_effect=env.run), \
+            mock.patch.object(u.shutil, "which", side_effect=env.which), \
+            mock.patch.object(u.os.path, "exists", return_value=True), \
+            mock.patch.object(u.ReleaseSources, "_latest", lambda s, src: releases[src]):
+        r = u.check_apps(cfg, Args(), {})
+    table = [b for b in r.blocks if b[0] == "table"]
+    rows = {row[0]: row for row in table[0][2]} if table else {}
+    return r, rows
+
+
+class AppsParserTests(unittest.TestCase):
     def test_parse_apt_policy(self):
-        self.assertEqual(u.parse_apt_policy(POLICY_REPO_NEWER), ("1.76.6", "1.78.1", True))
-        self.assertEqual(u.parse_apt_policy(POLICY_LOCAL_ONLY), ("2024.10.1", "2024.10.1", False))
+        self.assertEqual(u.parse_apt_policy(POLICY_REPO_NEWER), ("1.76.6", "1.78.1", [TS_REPO]))
+        self.assertEqual(u.parse_apt_policy(POLICY_LOCAL_ONLY), ("2024.10.1", "2024.10.1", []))
+
+    def test_parse_ubuntu_sources(self):
+        srcs = u.parse_ubuntu_sources(GLOBAL_POLICY)
+        self.assertIn(DO_MIRROR, srcs)                     # Ubuntu, via a cloud mirror
+        self.assertTrue(any("esm.ubuntu.com" in x for x in srcs))
+        self.assertNotIn(TS_REPO, srcs)                    # third-party repo
+
+    def test_parse_local_packages(self):
+        self.assertEqual(u.parse_local_packages(APT_INSTALLED),
+                         ["cloudflared", "libpython3.11", "libpython3.11-dev",
+                          "linux-image-6.8.0-40-generic", "oldtool"])
 
     def test_extract_version(self):
         self.assertEqual(u.extract_version("cloudflared version 2024.10.1 (built 2024-10-02-1234 UTC)"),
@@ -365,74 +449,117 @@ class AppsTests(unittest.TestCase):
         self.assertIsNone(u.extract_version("no digits"))
 
     def test_config(self):
-        cfg = make_cfg("[apps]\ntailscale = github:tailscale/tailscale\n"
+        cfg = make_cfg("[apps]\nauto_detect = no\nignore = oldtool, rclone\n"
                        "myapp = gitlab:me/myapp | /opt/myapp/bin/myapp --version\n")
-        self.assertEqual(cfg.apps["tailscale"], ("github:tailscale/tailscale", None))
-        self.assertEqual(cfg.apps["myapp"], ("gitlab:me/myapp", "/opt/myapp/bin/myapp --version"))
-        pihole = u.Config(os.path.join(ROOT, "examples", "pihole.conf"))
-        self.assertIn("cloudflared", pihole.apps)
-        self.assertIn("tailscale", pihole.apps)
+        self.assertFalse(cfg.apps_auto_detect)
+        self.assertEqual(cfg.apps_ignore, {"oldtool", "rclone"})
+        self.assertEqual(cfg.apps, {"myapp": ("gitlab:me/myapp", "/opt/myapp/bin/myapp --version")})
+        self.assertTrue(make_cfg("[general]\n").apps_auto_detect)    # on by default, no [apps] needed
+        for name in ("optiplex", "pihole", "droplet"):
+            u.Config(os.path.join(ROOT, "examples", name + ".conf"))
 
-    def run_apps(self, cfg_text, fake, releases):
-        cfg = make_cfg(cfg_text)
-        with mock.patch.object(u, "run", side_effect=fake), \
-                mock.patch.object(u.shutil, "which", side_effect=lambda n: "/opt/bin/" + n if n == "mytool" else None), \
-                mock.patch.object(u.ReleaseSources, "_latest", lambda s, src: releases[src]):
-            r = u.check_apps(cfg, Args(), {})
-        return r, {row[0]: row for row in r.blocks[0][2]}
 
-    def test_apt_repo_update_not_double_counted(self):
-        r, rows = self.run_apps("[apps]\ntailscale = github:tailscale/tailscale\n",
-                                apps_fake_run({"tailscale": POLICY_REPO_NEWER}, {"tailscale": "1.76.6"}),
-                                {"github:tailscale/tailscale": "v1.78.1"})
+class AppsCheckTests(unittest.TestCase):
+    def test_auto_detect_with_no_config(self):
+        env = AppsEnv(
+            dpkg={"tailscale": "1.76.6", "cloudflared": "2024.10.1", "rclone": "1.60.1+dfsg-3ubuntu0.24.04.1"},
+            policies={"tailscale": POLICY_REPO_NEWER, "cloudflared": POLICY_LOCAL_ONLY, "rclone": POLICY_UBUNTU},
+            binaries={"restic": lambda cmd: (0, "restic 0.17.1 compiled with go1.23\n", "")},
+            apt_installed=APT_INSTALLED)
+        r, rows = run_apps("[general]\nlabel = pihole\n", env,
+                           {"github:tailscale/tailscale": "v1.78.1", "github:cloudflare/cloudflared": "2025.10.0",
+                            "github:restic/restic": "v0.17.1"})
+        # Tailscale from its apt repo: shown, but apt already counts it
         self.assertIn("via apt", rows["tailscale"][4])
-        self.assertIn("apt repo", rows["tailscale"][3])
-        self.assertEqual(r.status, "update")
-        self.assertEqual(r.subject, [])   # already counted under System packages
+        self.assertIn("apt repo, auto-detected", rows["tailscale"][3])
+        # cloudflared from a downloaded .deb: apt never updates it -> counted
+        self.assertIn("installed manually", rows["cloudflared"][4])
+        self.assertIn("manual .deb", rows["cloudflared"][3])
+        # restic as a plain binary, read with its known version command
+        self.assertEqual(rows["restic"][4], "up to date")
+        self.assertIn(["/usr/local/bin/restic", "version"], env.ran)
+        # Ubuntu's own rclone package: left to the System packages check
+        self.assertNotIn("rclone", rows)
+        # other packages apt can't update: grouped, kernel left out, cloudflared not repeated
+        self.assertIn("python3.11 (libpython3.11, libpython3.11-dev)", rows)
+        self.assertIn("not checked", rows["python3.11 (libpython3.11, libpython3.11-dev)"][4])
+        self.assertIn("oldtool", rows)
+        self.assertFalse(any(k.startswith("linux") for k in rows))
+        self.assertEqual(sum(1 for k in rows if k.startswith("cloudflared")), 1)
+        self.assertEqual(r.subject, ["1 app update"])
+        self.assertIn("2 not checked", r.summary)
+        hint = [b[1] for b in r.blocks if b[0] == "pre"][0]
+        self.assertIn("python3.11 = github:OWNER/REPO", hint)
+        self.assertIn("ignore = oldtool, python3.11", hint)
+        # never asked tailscale/cloudflared (dpkg-installed) to run at all
+        self.assertFalse(any(os.path.basename(c[0]) in ("tailscale", "cloudflared") for c in env.ran))
 
     def test_released_but_not_in_apt_repo_yet(self):
-        r, rows = self.run_apps("[apps]\ntailscale = github:tailscale/tailscale\n",
-                                apps_fake_run({"tailscale": POLICY_REPO_SAME}, {"tailscale": "1.76.6"}),
-                                {"github:tailscale/tailscale": "v1.78.1"})
+        env = AppsEnv(dpkg={"tailscale": "1.76.6"}, policies={"tailscale": POLICY_REPO_SAME})
+        r, rows = run_apps("[general]\n", env, {"github:tailscale/tailscale": "v1.78.1"})
         self.assertIn("not yet in the apt repo", rows["tailscale"][4])
         self.assertEqual(r.status, "ok")
         self.assertEqual(r.subject, [])
 
-    def test_manual_deb_and_binary_and_errors(self):
-        fake = apps_fake_run(
-            {"cloudflared": POLICY_LOCAL_ONLY, "broken": POLICY_LOCAL_ONLY},
-            {"cloudflared": "2024.10.1", "broken": "1.0"},
-            {"/opt/bin/mytool": lambda cmd: (0, "mytool 3.2.1\n", ""),
-             "/srv/odd/bin/odd": lambda cmd: (0, "odd v0.9\n", "")})
-        r, rows = self.run_apps(
-            "[apps]\ncloudflared = github:cloudflare/cloudflared\nmytool = github:me/mytool\n"
+    def test_configured_apps_and_ignore(self):
+        env = AppsEnv(
+            dpkg={"broken": "1.0"}, policies={"broken": POLICY_LOCAL_ONLY},
+            binaries={"mytool": lambda cmd: (0, "mytool 3.2.1\n", ""),
+                      "odd": lambda cmd: (0, "odd v0.9\n", ""),
+                      "cloudflared": lambda cmd: (0, "cloudflared version 2025.10.0 (built x)\n", "")},
+            apt_installed=APT_INSTALLED)
+        r, rows = run_apps(
+            "[apps]\nignore = oldtool, python3.11\nmytool = github:me/mytool\n"
             "odd = gitlab:me/odd | /srv/odd/bin/odd --print-version\nghost = github:me/ghost\n"
             "broken = github:me/broken\n",
-            fake, {"github:cloudflare/cloudflared": "2025.10.0", "github:me/mytool": "v3.2.1",
-                   "gitlab:me/odd": "v1.0", "github:me/broken": "x"})
-        self.assertIn("installed manually", rows["cloudflared"][4])
-        self.assertIn("manual .deb", rows["cloudflared"][3])
+            env, {"github:me/mytool": "v3.2.1", "gitlab:me/odd": "v1.0", "github:me/broken": "x",
+                  "github:cloudflare/cloudflared": "2025.10.0"})
         self.assertEqual(rows["mytool"][4], "up to date")
-        self.assertEqual(rows["odd"][1], "0.9")                 # from the configured command
-        self.assertIn("update available", rows["odd"][4])
+        self.assertIn(["/usr/local/bin/mytool", "--version"], env.ran)   # only --version is guessed
+        self.assertEqual(rows["odd"][1], "0.9")                          # configured command
+        self.assertIn(["/srv/odd/bin/odd", "--print-version"], env.ran)
         self.assertIn("not installed", rows["ghost"][4])
-        self.assertIn("cannot compare", rows["broken"][4])     # release tag "x" has no version
-        self.assertEqual(r.subject, ["2 app updates", "1 app check failed"])
+        self.assertIn("cannot compare", rows["broken"][4])
+        self.assertEqual(rows["cloudflared"][4], "up to date")           # binary, auto-detected
+        self.assertNotIn("oldtool", rows)                                # ignored
+        self.assertFalse(any(k.startswith("python3.11") for k in rows))  # ignored by source name
+        self.assertEqual(r.subject, ["1 app update", "1 app check failed"])
+
+    def test_configured_known_app_reuses_known_command(self):
+        env = AppsEnv(binaries={"tailscale": lambda cmd: (0, "1.78.1\n  go version: go1.23\n", "")})
+        r, rows = run_apps("[apps]\ntailscale = github:tailscale/tailscale\n", env,
+                           {"github:tailscale/tailscale": "v1.78.1"})
+        self.assertEqual(rows["tailscale"][4], "up to date")
+        self.assertIn(["/usr/local/bin/tailscale", "version"], env.ran)
+        self.assertNotIn(["/usr/local/bin/tailscale", "--version"], env.ran)
+
+    def test_unreadable_version_suggests_command(self):
+        env = AppsEnv(binaries={"weird": lambda cmd: (2, "", "flag provided but not defined: -version")})
+        r, rows = run_apps("[apps]\nweird = github:me/weird\n", env, {})
+        self.assertIn("weird = SOURCE | weird -v", rows["weird"][4])
+        self.assertEqual(len([c for c in env.ran if "weird" in c[0]]), 1)   # tried --version only
 
     def test_release_lookup_failure(self):
         def boom(s, src):
             raise RuntimeError("GitHub API rate limit reached")
-        cfg = make_cfg("[apps]\ncloudflared = github:cloudflare/cloudflared\n")
-        fake = apps_fake_run({"cloudflared": POLICY_LOCAL_ONLY}, {"cloudflared": "2024.10.1"})
-        with mock.patch.object(u, "run", side_effect=fake), \
+        env = AppsEnv(dpkg={"cloudflared": "2024.10.1"}, policies={"cloudflared": POLICY_LOCAL_ONLY})
+        cfg = make_cfg("[general]\n")
+        with mock.patch.object(u, "run", side_effect=env.run), \
+                mock.patch.object(u.shutil, "which", side_effect=env.which), \
                 mock.patch.object(u.ReleaseSources, "_latest", boom):
             r = u.check_apps(cfg, Args(), {})
         self.assertEqual(r.status, "warn")
         self.assertIn("rate limit", r.blocks[0][2][0][4])
         self.assertEqual(r.subject, ["1 app check failed"])
 
-    def test_no_apps_configured(self):
-        self.assertEqual(u.check_apps(make_cfg("[general]\n"), Args(), {}).status, "skipped")
+    def test_nothing_found(self):
+        r, rows = run_apps("[general]\n", AppsEnv(), {})
+        self.assertEqual(r.status, "ok")
+        self.assertEqual(r.summary, "No third-party apps found")
+
+    def test_auto_detect_off_and_nothing_listed(self):
+        r = u.check_apps(make_cfg("[apps]\nauto_detect = no\n"), Args(), {})
+        self.assertEqual(r.status, "skipped")
 
 
 class EmailTests(unittest.TestCase):

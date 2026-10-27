@@ -34,17 +34,18 @@ mount_points = /
 warn_percent = 80
 
 [apps]
-# Other software installed directly on this machine (not in Docker).
-#   name = release source [| version command]
-# "name" is the apt package name and/or the command on PATH. The installed
-# version comes from dpkg, else from "NAME --version" / "NAME version", or
-# from the command after "|" if given. Sources as in [docker.images]:
-# github:OWNER/REPO or gitlab:GROUP/PROJECT.
-# If the app comes from an apt repo (e.g. Tailscale's), apt updates are shown
-# under System packages and not counted twice.
-# tailscale = github:tailscale/tailscale
-# cloudflared = github:cloudflare/cloudflared
-# myapp = github:owner/myapp | /opt/myapp/bin/myapp --version
+# Apps installed outside Docker. Nothing needs adding here: well-known apps
+# (Tailscale, cloudflared, rclone, restic, caddy, netbird, node_exporter,
+# lazydocker) are found and checked automatically, and any package apt can't
+# update (installed from a downloaded .deb, or its repo was removed) is listed.
+# To track something else:
+#   name = github:OWNER/REPO        (or gitlab:GROUP/PROJECT)
+#   name = github:OWNER/REPO | /path/to/program --version
+#                                   (the command that prints its version,
+#                                    if "name --version" doesn't work)
+auto_detect = yes
+# Names (apps or packages) to leave out of the report, comma-separated
+ignore =
 
 [docker]
 # Extra tags to treat as "floating" (checked by comparing digests). Tags with

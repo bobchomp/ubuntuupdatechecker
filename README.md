@@ -19,7 +19,7 @@ whose behaviour is set by `/etc/update-checker/config`.
 | Unattended upgrades | installed? `APT::Periodic` settings, apt-daily timers, last run. Warns if off |
 | Disk space | usage per mount point, warning at a threshold (default 80%); flags a data disk that isn't mounted |
 | Pi-hole | core / FTL / web versions from `pihole -v` (skipped if Pi-hole isn't installed) |
-| Other apps | apps installed outside Docker (Tailscale, cloudflared, ...): installed version vs latest GitHub/GitLab release |
+| Other apps | apps installed outside Docker, **found automatically** (Tailscale, cloudflared, ...): installed version vs latest release; also lists any package apt can't update |
 | Docker | every running container: name, image, tag, latest version, status; plus `docker system df` reclaimable space |
 
 If one check fails (a registry is down, a command errors) the report says so in
@@ -107,9 +107,8 @@ containers listed as "not checked" to the map. See
 sudo ./install.sh --machine pihole
 ```
 
-The Docker check is disabled, the Pi-hole check is on, Tailscale and
-cloudflared are listed under `[apps]` (delete either line if it isn't
-installed, or leave it: it just shows as "not installed"), and
+The Docker check is disabled, the Pi-hole check is on (Tailscale and
+cloudflared are picked up automatically by the [apps check](#other-apps-tailscale-cloudflared-)), and
 `send_when_up_to_date = no` so you only get email when something needs doing.
 Change that to `yes` if you'd like a "[pihole] All up to date" every 3 days as
 proof it's alive.
@@ -182,31 +181,32 @@ sudo chmod 600 /etc/update-checker/secret.env
 
 ## Other apps (Tailscale, cloudflared, ...)
 
-For software installed directly on the machine rather than in Docker, list it
-under `[apps]`:
+Apps installed directly on a machine (not in Docker) are found automatically,
+the same way on every machine, with nothing to configure.
 
-```ini
-[apps]
-tailscale = github:tailscale/tailscale
-cloudflared = github:cloudflare/cloudflared
-```
+**Well-known apps** are checked wherever they're installed:
 
-Format: `name = source`, optionally followed by `| version command`.
+| App | Compared with |
+|---|---|
+| tailscale | github:tailscale/tailscale |
+| cloudflared | github:cloudflare/cloudflared |
+| rclone | github:rclone/rclone |
+| restic | github:restic/restic |
+| caddy | github:caddyserver/caddy |
+| netbird | github:netbirdio/netbird |
+| node_exporter | github:prometheus/node_exporter |
+| lazydocker | github:jesseduffield/lazydocker |
 
-- **name** is the apt package name and/or the command on the PATH.
-- **source** is `github:OWNER/REPO` or `gitlab:GROUP/PROJECT`, as for
-  [Docker](#sources).
+**Anything apt can't update** is listed too. That means any installed package
+that no apt source provides: installed from a downloaded `.deb`, or its
+repository was removed. These rows say "not checked (apt can't update it)",
+and the report prints lines you can paste to track or hide them. Old kernel
+packages are left out.
 
-The installed version is read, in this order, from:
+Ubuntu's own packages (e.g. Ubuntu's `rclone`) are left to the System
+packages check, so nothing appears twice.
 
-1. the command after `|`, if you gave one;
-2. dpkg, if a package called `name` is installed;
-3. `name --version`, then `name version`.
-
-The checker only ever asks programs for their version. It never runs them any
-other way.
-
-The report also says *how* each app was installed, because that decides what
+The report says *how* each app was installed, because that decides what
 updates it:
 
 | Installed via | What the report says |
@@ -215,14 +215,38 @@ updates it:
 | **manual .deb** (e.g. cloudflared installed with `dpkg -i` as Cloudflare's tunnel setup page shows) | apt will **never** update it. An update shows as "installed manually, apt won't update it" and counts as an app update in the subject. |
 | **binary** on the PATH | Same as manual .deb. |
 
-If an app's version can't be read automatically, give the command:
+The installed version comes from dpkg where possible. Otherwise the app is
+asked for its version with a command known to only print it (e.g.
+`tailscale version`). Nothing is ever run any other way.
+
+### Tracking or hiding something else
+
+Only needed for apps that aren't in the list above:
 
 ```ini
-myapp = github:owner/myapp | /opt/myapp/bin/myapp --version
+[apps]
+auto_detect = yes
+ignore = python3.11, oldtool          # leave these out of the report
+myapp = github:owner/myapp            # check this one too
+otherapp = gitlab:group/otherapp | /opt/otherapp/bin/otherapp -v
 ```
 
-The first version-looking string in its output (e.g. `2024.10.1`) is used.
+- `name = github:OWNER/REPO` (or `gitlab:GROUP/PROJECT`). `name` is the apt
+  package name and/or the command on the PATH.
+- Without a command, the installed version comes from dpkg, or else from
+  `name --version`. If that doesn't print a version, add the right command
+  after `|`. The report tells you when this is needed. Only `--version` is
+  ever guessed, never other arguments that might start the program.
+- An entry for a well-known app replaces the built-in one (e.g. to use a
+  different source).
+- `auto_detect = no` turns off both the built-in list and the
+  "apt can't update" listing, leaving only what you list.
+
 Test with `sudo update-checker --dry-run --only apps`.
+
+To add an app to the built-in list for **all** machines, add it to
+`KNOWN_APPS` in `update_checker.py` and re-run `sudo ./install.sh` on each
+machine (or `git pull` first if the change was made elsewhere).
 
 ---
 

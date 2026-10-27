@@ -562,6 +562,93 @@ class AppsCheckTests(unittest.TestCase):
         self.assertEqual(r.status, "skipped")
 
 
+class MainEmailTests(unittest.TestCase):
+    """Every run emails the report, however it was started."""
+
+    def run_main(self, argv, cfg_text="[general]\nlabel = pihole\nrecipient = me@example.com\n",
+                 secrets="RESEND_API_KEY=re_test\n", env=None, up_to_date=True):
+        res = u.CheckResult("apt", "System packages")
+        res.summary = "All packages up to date"
+        if not up_to_date:
+            res.subject = ["3 updates"]
+        with tempfile.TemporaryDirectory() as d:
+            conf, sec = os.path.join(d, "config"), os.path.join(d, "secret.env")
+            with open(conf, "w") as fh:
+                fh.write(cfg_text)
+            with open(sec, "w") as fh:
+                fh.write(secrets)
+            out = mock.MagicMock()
+            with mock.patch.object(u, "run_checks", return_value=[res]), \
+                    mock.patch.object(u, "send_resend", return_value="id1") as send, \
+                    mock.patch.object(u.sys, "stdout", out), \
+                    mock.patch.dict(os.environ, env or {}, clear=True):
+                rc = u.main(argv + ["--config", conf, "--secrets", sec])
+        printed = "".join(c.args[0] for c in out.write.call_args_list)
+        return rc, send, printed
+
+    def test_plain_run_emails(self):
+        rc, send, printed = self.run_main([])
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        self.assertEqual(printed, "")
+        subject, html, text = send.call_args.args[3], send.call_args.args[4], send.call_args.args[5]
+        self.assertEqual(subject, "[pihole] All up to date")
+        self.assertIn("Started by command: update-checker --config", text)
+        self.assertIn("Started by command", html)
+
+    def test_dry_run_prints_and_emails(self):
+        rc, send, printed = self.run_main(["--dry-run"])
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        self.assertIn("Subject: [pihole] All up to date", printed)
+        self.assertIn("update-checker --dry-run", printed)
+
+    def test_no_email(self):
+        rc, send, printed = self.run_main(["--no-email"])
+        self.assertEqual(rc, 0)
+        send.assert_not_called()
+        self.assertIn("Subject: [pihole]", printed)
+
+    def test_partial_run_marked_in_subject(self):
+        rc, send, _ = self.run_main(["--only", "docker,apt"], up_to_date=False)
+        self.assertEqual(send.call_args.args[3], "[pihole] (apt, docker only) 3 updates")
+
+    def test_scheduled_run(self):
+        rc, send, _ = self.run_main([], env={"INVOCATION_ID": "abc"})
+        self.assertIn("Scheduled run (update-checker.service)", send.call_args.args[5])
+
+    def test_missing_key_prints_report_once(self):
+        rc, send, printed = self.run_main(["--dry-run"], secrets="")
+        self.assertEqual(rc, 2)
+        send.assert_not_called()
+        self.assertEqual(printed.count("Subject: [pihole]"), 1)
+
+    def test_send_failure_keeps_report(self):
+        with mock.patch.object(u, "send_resend", side_effect=RuntimeError("HTTP 500")):
+            res = u.CheckResult("apt", "x")
+            with tempfile.TemporaryDirectory() as d:
+                conf, sec = os.path.join(d, "c"), os.path.join(d, "s")
+                open(conf, "w").write("[general]\nrecipient = a@b.c\n")
+                open(sec, "w").write("RESEND_API_KEY=re_k\n")
+                out = mock.MagicMock()
+                with mock.patch.object(u, "run_checks", return_value=[res]), \
+                        mock.patch.object(u.sys, "stdout", out), mock.patch.dict(os.environ, {}, clear=True):
+                    rc = u.main(["--config", conf, "--secrets", sec])
+        self.assertEqual(rc, 1)
+        self.assertIn("Subject:", "".join(c.args[0] for c in out.write.call_args_list))
+
+    def test_send_when_up_to_date_no_is_still_honoured(self):
+        rc, send, _ = self.run_main([], cfg_text="[general]\nrecipient = a@b.c\nsend_when_up_to_date = no\n")
+        send.assert_not_called()
+        rc, send, _ = self.run_main([], cfg_text="[general]\nrecipient = a@b.c\nsend_when_up_to_date = no\n",
+                                    up_to_date=False)
+        send.assert_called_once()
+
+    def test_examples_email_every_run(self):
+        for name in ("optiplex", "pihole", "droplet"):
+            self.assertTrue(u.Config(os.path.join(ROOT, "examples", name + ".conf")).send_when_up_to_date)
+
+
 class EmailTests(unittest.TestCase):
     def test_resend_payload(self):
         captured = {}

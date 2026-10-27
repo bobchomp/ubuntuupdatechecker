@@ -90,6 +90,18 @@ install -m 0644 "$SRC"/examples/*.conf "$SHARE/examples/"
 install -d -m 0755 -o root -g root "$CONF_DIR"
 if [ -f "$CONF" ] && [ "$RECONFIGURE" -eq 0 ]; then
     info "Keeping existing $CONF (use --reconfigure to recreate it)"
+    # Older example configs skipped the email when everything was up to date.
+    if grep -Eq '^[[:space:]]*send_when_up_to_date[[:space:]]*=[[:space:]]*(no|false|off|0)[[:space:]]*$' "$CONF"; then
+        echo
+        echo "This machine's config skips the email when everything is up to date"
+        echo "(send_when_up_to_date = no)."
+        if [ -t 0 ] && yesno "Email a report on every run instead?" y; then
+            set_conf send_when_up_to_date yes
+            info "Set send_when_up_to_date = yes"
+        else
+            info "Left as is - change it in $CONF if you want every run emailed"
+        fi
+    fi
 else
     need_tty "the config needs to be created"
     if [ -z "$MACHINE" ]; then
@@ -195,14 +207,10 @@ cat <<EOF
 
   Config:       $CONF
   Secrets:      $SECRET
-  Test:         sudo update-checker --dry-run
-  Run now:      sudo systemctl start update-checker.service
+  Run now:      sudo update-checker --dry-run   (prints the report here and emails it)
+  Preview only: sudo update-checker --no-email  (prints it, no email)
   Logs:         journalctl -u update-checker.service
 
-The first scheduled report is sent within a few minutes, then every 3 days.
+The first report is emailed within a few minutes (follow it with:
+journalctl -u update-checker.service -f), then every 3 days.
 EOF
-
-echo
-if [ -t 0 ] && yesno "Run a dry run now (prints the report here, sends nothing)?" n; then
-    "$BIN" --dry-run || true
-fi

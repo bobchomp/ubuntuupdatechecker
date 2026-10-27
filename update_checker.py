@@ -278,13 +278,24 @@ def skipped(result, reason):
     return result
 
 
-def render_text(label, results, subject):
+def run_origin(argv=None):
+    """Describe how this run was started. systemd sets INVOCATION_ID for
+    service runs (the timer, or `systemctl start update-checker`)."""
+    if os.environ.get("INVOCATION_ID"):
+        return "Scheduled run (update-checker.service)"
+    args = sys.argv[1:] if argv is None else argv
+    return "Started by command: update-checker %s" % " ".join(shlex.quote(a) for a in args)
+
+
+def render_text(label, results, subject, origin=""):
     out = []
     out.append("=" * 72)
     out.append("Subject: %s" % subject)
     out.append("=" * 72)
     out.append("Machine: %s (%s)   %s" % (label, socket.getfqdn(), os_pretty_name()))
     out.append("Generated: %s" % now_str())
+    if origin:
+        out.append(origin)
     out.append("")
     out.append("SUMMARY")
     width = max(len(r.title) for r in results)
@@ -324,7 +335,7 @@ def render_text(label, results, subject):
     return "\n".join(out).rstrip() + "\n"
 
 
-def render_html(label, results, subject):
+def render_html(label, results, subject, origin=""):
     e = html.escape
     row_bg = {"alert": "#ffebe9", "warn": "#fff1e5", "error": "#fbefff", "update": "#fff8c5"}
 
@@ -375,6 +386,8 @@ def render_html(label, results, subject):
     parts.append('<h1 style="font-size:20px;margin:0 0 4px">%s</h1>' % e(subject))
     parts.append('<div style="font-size:12px;color:#57606a">%s &middot; %s &middot; %s</div>'
                  % (e(socket.getfqdn()), e(os_pretty_name()), e(now_str())))
+    if origin:
+        parts.append('<div style="font-size:12px;color:#57606a">%s</div>' % e(origin))
     parts.append('<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%;margin-top:14px">')
     for r in results:
         bg = row_bg.get(r.status, "")
@@ -1633,7 +1646,7 @@ def send_resend(api_key, sender, recipients, subject, html_body, text_body):
 # Main
 # --------------------------------------------------------------------------
 
-def build_subject(label, results):
+def build_subject(label, results, only=None):
     order = {"apt": 10, "snap": 20, "docker": 30, "apps": 35, "pihole": 40, "reboot": 50, "disk": 60,
              "unattended_upgrades": 70, "pro": 80}
     parts = []
@@ -1642,7 +1655,8 @@ def build_subject(label, results):
     failed = sum(1 for r in results if r.status == "error" and not r.subject)
     if failed:
         parts.append(plural(failed, "check") + " failed")
-    return "[%s] %s" % (label, ", ".join(parts) if parts else "All up to date"), not parts
+    scope = "(%s only) " % ", ".join(only) if only else ""
+    return "[%s] %s%s" % (label, scope, ", ".join(parts) if parts else "All up to date"), not parts
 
 
 def run_checks(cfg, args, secrets):
@@ -1688,7 +1702,9 @@ def main(argv=None):
         prog="update-checker",
         description="Report-only update checker. Emails an HTML report via Resend.")
     p.add_argument("--dry-run", action="store_true",
-                   help="run all checks and print the report instead of emailing it")
+                   help="also print the report to the terminal (it is still emailed)")
+    p.add_argument("--no-email", action="store_true",
+                   help="print the report to the terminal and don't send an email")
     p.add_argument("--config", default=DEFAULT_CONFIG, help="config file (default: %(default)s)")
     p.add_argument("--secrets", default=DEFAULT_SECRETS, help="secrets file (default: %(default)s)")
     p.add_argument("--only", metavar="CHECKS",
@@ -1710,20 +1726,26 @@ def main(argv=None):
         log("warning: not running as root; apt update and some checks may fail")
 
     results = run_checks(cfg, args, secrets)
-    subject, up_to_date = build_subject(cfg.label, results)
-    text_body = render_text(cfg.label, results, subject)
-    html_body = render_html(cfg.label, results, subject)
+    only = [c for c in CHECK_ORDER if c in split_list(args.only)] if args.only else None
+    subject, up_to_date = build_subject(cfg.label, results, only)
+    origin = run_origin(argv)
+    text_body = render_text(cfg.label, results, subject, origin)
+    html_body = render_html(cfg.label, results, subject, origin)
 
     if args.html:
         with open(args.html, "w", encoding="utf-8") as fh:
             fh.write(html_body)
         log("HTML report written to %s" % args.html)
 
-    if args.dry_run:
+    if args.no_email:
         sys.stdout.write(text_body)
-        if up_to_date and not cfg.send_when_up_to_date:
-            log("(dry run) everything is up to date and send_when_up_to_date = no: no email would be sent")
+        log("--no-email: report not emailed")
         return 0
+    # The report goes to stdout too for --dry-run, and whenever the email
+    # can't be sent, so it isn't lost (it ends up in the journal).
+    printed = args.dry_run
+    if printed:
+        sys.stdout.write(text_body)
 
     log(subject)
     if up_to_date and not cfg.send_when_up_to_date:
@@ -1731,19 +1753,23 @@ def main(argv=None):
         return 0
     api_key = secrets.get("RESEND_API_KEY", "")
     if not api_key or api_key.startswith("re_xxxx"):
-        log("error: RESEND_API_KEY is not set in %s" % args.secrets)
-        sys.stdout.write(text_body)
+        log("error: email not sent: RESEND_API_KEY is not set in %s%s" % (
+            args.secrets, "" if os.geteuid() == 0 else " (or not readable - run with sudo)"))
+        if not printed:
+            sys.stdout.write(text_body)
         return 2
     if not cfg.recipients:
-        log("error: no recipient set in [general] recipient in %s" % args.config)
-        sys.stdout.write(text_body)
+        log("error: email not sent: no recipient set in [general] recipient in %s" % args.config)
+        if not printed:
+            sys.stdout.write(text_body)
         return 2
     sender = "%s <%s>" % (cfg.from_name, cfg.from_address) if cfg.from_name else cfg.from_address
     try:
         msg_id = send_resend(api_key, sender, cfg.recipients, subject, html_body, text_body)
     except RuntimeError as exc:
         log("error: sending email failed: %s" % exc)
-        sys.stdout.write(text_body)  # keep the report in the journal
+        if not printed:
+            sys.stdout.write(text_body)  # keep the report in the journal
         return 1
     log("Email sent to %s (id %s)" % (", ".join(cfg.recipients), msg_id))
     return 0

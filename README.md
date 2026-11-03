@@ -268,6 +268,16 @@ are compared with the latest release from a source you configure in
 `[docker.images]`. Pinned containers whose image isn't in the map are listed as
 **"not checked"**, and the report prints the exact line to add.
 
+**Images built on the machine itself** (e.g. with `docker compose build`, so
+named like `myproject-backend`) are shown as **"built locally"**. No registry
+has a copy to compare against, so they aren't looked up online and aren't
+counted as failures. Leave them out of the report entirely with
+`ignore_containers =` in `[docker]` if you prefer.
+
+For tags that only name a major version (`caddy:2-alpine`, `postgres:16`), the
+suggested line is `= digest`, because the tag moves to each new release. The
+report then tells you when a newer image has been pushed under that tag.
+
 ### Adding a container
 
 1. Find the image name:

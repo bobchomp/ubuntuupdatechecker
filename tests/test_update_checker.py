@@ -205,6 +205,9 @@ IMG = {
                       "Config": {"Labels": {}}},
     "sha256:broken": {"Id": "sha256:broken", "RepoDigests": ["ghcr.io/x/broken@sha256:b"],
                       "Config": {"Labels": {}}},
+    # Built on the machine (docker compose build): no RepoDigests
+    "sha256:devbe": {"Id": "sha256:devbe", "RepoDigests": [], "Config": {"Labels": {}}},
+    "sha256:caddy": {"Id": "sha256:caddy", "RepoDigests": ["caddy@sha256:cd1"], "Config": {"Labels": {}}},
 }
 CONTAINERS = [
     ("immich_server", "ghcr.io/immich-app/immich-server:v3.1.0@sha256:i1", "sha256:immich"),
@@ -215,6 +218,9 @@ CONTAINERS = [
     ("jellyfin", "jellyfin/jellyfin:latest", "sha256:jelly"),
     ("sonarr", "lscr.io/linuxserver/sonarr:4.0.9.2244-ls257", "sha256:sonarr"),
     ("broken", "ghcr.io/x/broken:latest", "sha256:broken"),
+    ("dev-backend", "dev-backend", "sha256:devbe"),
+    ("rtmpwebplayer-backend-1", "rtmpwebplayer-backend:latest", "sha256:devbe"),
+    ("rtmpwebplayer-caddy-1", "caddy:2-alpine", "sha256:caddy"),
 ]
 REMOTE_DIGESTS = {("docker.io", "library/nginx", "latest"): "sha256:new",
                   ("docker.io", "library/postgres", "16-alpine"): "sha256:p1"}
@@ -240,6 +246,8 @@ def fake_run(cmd, timeout=120, env_extra=None):
 
 
 def fake_digest(self, registry, repo, tag):
+    if "dev-backend" in repo or "rtmpwebplayer" in repo:
+        raise AssertionError("locally built image must not be looked up online")
     if repo == "x/broken":
         raise RuntimeError("ghcr.io: connection refused")
     return REMOTE_DIGESTS[(registry, repo, tag)]
@@ -281,10 +289,18 @@ lscr.io/linuxserver/sonarr = registry
         self.assertEqual(rows["sonarr"][4], "4.0.10.2544-ls260")         # registry tag compare
         self.assertIn("check failed", rows["broken"][5])                 # registry unreachable
         self.assertEqual(r.subject, ["4 containers outdated", "1 container check failed"])
-        self.assertIn("1 not checked", r.summary)
-        # unmapped hint names the exact key to add
+        self.assertIn("4 not checked", r.summary)
+        # locally built images: not errors, shown by the name they were built as
+        for local in ("dev-backend", "rtmpwebplayer-backend-1"):
+            self.assertEqual(rows[local][5], "built locally (no registry to compare against)")
+        self.assertEqual(rows["dev-backend"][1], "dev-backend")
+        self.assertEqual(rows["rtmpwebplayer-backend-1"][1], "rtmpwebplayer-backend:latest")
+        # unmapped hint names the exact key to add; moving major tags get "digest"
         pre = [b for b in r.blocks if b[0] == "pre"][0][1]
-        self.assertIn("docker.io/library/redis = ", pre)
+        self.assertIn("docker.io/library/redis = github:OWNER/REPO", pre)
+        self.assertIn("docker.io/library/caddy = digest", pre)
+        self.assertNotIn("dev-backend", pre)
+        self.assertNotIn("rtmpwebplayer", pre)
         # docker system df table is present
         self.assertTrue(any(b[0] == "table" and b[1][0] == "Type" for b in r.blocks))
 
@@ -647,6 +663,34 @@ class MainEmailTests(unittest.TestCase):
     def test_examples_email_every_run(self):
         for name in ("optiplex", "pihole", "droplet"):
             self.assertTrue(u.Config(os.path.join(ROOT, "examples", name + ".conf")).send_when_up_to_date)
+
+
+class DockerHelperTests(unittest.TestCase):
+    def test_suggest_image_source(self):
+        for tag in ("2-alpine", "16", "8-bookworm", "v3"):
+            self.assertIn("= digest", u.suggest_image_source("x/y", tag), tag)
+        for tag in ("7.2.4", "v1.2.3", "16.4-alpine", "4.0.9.2244-ls257"):
+            self.assertIn("= github:OWNER/REPO", u.suggest_image_source("x/y", tag), tag)
+
+    def test_registry_denied_message(self):
+        reg = u.Registry.__new__(u.Registry)
+        reg.tokens, reg.docker_auths = {}, {}
+        with mock.patch.object(u.Registry, "request", return_value=u.HTTPResult(401, {}, b"")):
+            with self.assertRaises(RuntimeError) as cm:
+                reg.manifest_digest("docker.io", "library/dev-rtmp", "latest")
+        self.assertIn("doesn't exist on that registry or is private (HTTP 401)", str(cm.exception))
+        self.assertTrue(str(cm.exception).endswith("sudo docker login"))
+
+    def test_mapped_local_build_with_floating_tag(self):
+        # A local build mapped to a release source still gets "built locally", no lookup
+        cfg = make_cfg("[docker.images]\ndev-backend = github:me/backend\n")
+        ref = u.parse_image_ref("dev-backend")
+        status, latest, note = u.evaluate_container(
+            cfg, ref, IMG["sha256:devbe"], "github:me/backend",
+            mock.Mock(latest=mock.Mock(return_value="v2.0")),
+            mock.Mock(side_effect=AssertionError("no lookup")), None)
+        self.assertEqual(status, "not_checked")
+        self.assertIn("built locally", note)
 
 
 class EmailTests(unittest.TestCase):

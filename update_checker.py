@@ -1002,10 +1002,18 @@ class Registry:
             resp = http(url, method=method, headers=headers)
         return resp
 
+    @staticmethod
+    def denied(registry, repo, status):
+        login = "sudo docker login" + ("" if registry == "docker.io" else " " + registry)
+        return ("%s/%s doesn't exist on that registry or is private (HTTP %s). If it's private, "
+                "log in once with: %s" % (registry, repo, status, login))
+
     def manifest_digest(self, registry, repo, tag):
         resp = self.request(registry, repo, "manifests/" + tag, method="HEAD", accept=MANIFEST_ACCEPT)
         if resp.status == 404:
             raise RuntimeError("tag %s not found in %s/%s" % (tag, registry, repo))
+        if resp.status in (401, 403):
+            raise RuntimeError(self.denied(registry, repo, resp.status))
         digest = resp.headers.get("Docker-Content-Digest")
         if resp.status in (405, 400) or (resp.status == 200 and not digest):
             # Some registries don't support HEAD or omit the header; fall back to GET.
@@ -1026,6 +1034,8 @@ class Registry:
             resp = self.request(registry, repo, path)
             if resp.status == 429:
                 raise RuntimeError("%s rate limit reached" % registry)
+            if resp.status in (401, 403):
+                raise RuntimeError(self.denied(registry, repo, resp.status))
             if resp.status != 200:
                 raise RuntimeError("tag list for %s/%s failed (HTTP %s)" % (registry, repo, resp.status))
             tags.extend(resp.json().get("tags") or [])
@@ -1493,14 +1503,22 @@ def check_docker(cfg, args, secrets):
         tag = ref["tag"]
         display_tag = (tag or "latest") + ("@" + ref["digest"][7:19] if ref["digest"] else "")
         source = cfg.image_sources.get(ref["name"])
-        try:
-            status, latest, note = evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tags)
-        except Exception as exc:
-            status, latest, note = "error", "?", "check failed: %s" % exc
-        if status == "not_checked" and not source:
-            unmapped.append(ref["name"])
+        # Pulled images record the registry they came from; images built on
+        # this machine have no RepoDigests at all.
+        local_build = bool(img) and not img.get("RepoDigests") and not ref["digest"]
+        if local_build and not source:
+            status, latest, note = "not_checked", "-", LOCAL_BUILD_NOTE
+        else:
+            try:
+                status, latest, note = evaluate_container(cfg, ref, img, source, sources, remote_digest,
+                                                          remote_tags)
+            except Exception as exc:
+                status, latest, note = "error", "?", "check failed: %s" % exc
+        if status == "not_checked" and not source and not local_build:
+            unmapped.append((ref["name"], tag or "latest"))
         counts[status] += 1
-        rows.append([name, ref["name"], display_tag, source or "-", latest, note])
+        rows.append([name, image_str.split("@")[0] if local_build else ref["name"], display_tag,
+                     source or "-", latest, note])
         levels.append({"outdated": "update", "error": "error"}.get(status))
 
     # Outdated first, then failures, then the rest (stable sort keeps names in order)
@@ -1515,8 +1533,7 @@ def check_docker(cfg, args, secrets):
     if unmapped:
         r.add_para("Containers with a version-pinned tag are only checked if their image is in the "
                    "[docker.images] map in /etc/update-checker/config. To check these, add lines like:")
-        r.add_pre("\n".join("%s = github:OWNER/REPO    # or gitlab:GROUP/PROJECT, registry, digest" % n
-                            for n in sorted(set(unmapped))))
+        r.add_pre("\n".join(suggest_image_source(n, t) for n, t in sorted(set(unmapped))))
 
     # Reclaimable space
     try:
@@ -1548,6 +1565,18 @@ def check_docker(cfg, args, secrets):
     return r
 
 
+LOCAL_BUILD_NOTE = "built locally (no registry to compare against)"
+
+
+def suggest_image_source(name, tag):
+    """Config line suggested for an unmapped image. A tag naming only a major
+    version ('2-alpine', '16', '8-bookworm') moves with every release, so
+    comparing digests is the useful check; full versions need a release source."""
+    if re.fullmatch(r"v?\d+(-[a-z][\w.-]*)?", tag):
+        return "%s = digest    # '%s' moves with new releases: report when it's re-pushed" % (name, tag)
+    return "%s = github:OWNER/REPO    # or gitlab:GROUP/PROJECT, registry, digest" % name
+
+
 def evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tags):
     """Return (status, latest, note) where status is one of
     outdated / ok / not_checked / error."""
@@ -1560,7 +1589,6 @@ def evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tag
     def digest_compare(prefix=""):
         if not ref["tag"] and ref["digest"]:
             return "not_checked", "-", prefix + "pinned by digest only, no tag to compare against"
-        remote = remote_digest(dict(ref, tag=tag))
         local = set()
         for rd in img.get("RepoDigests") or []:
             try:
@@ -1572,7 +1600,10 @@ def evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tag
         if ref["digest"]:
             local.add(ref["digest"])
         if not local:
-            return "not_checked", remote[7:19], prefix + "no registry digest for the local image (built locally?)"
+            # Never pulled from a registry under this name (e.g. built with
+            # `docker compose build`), so there's nothing online to compare with.
+            return "not_checked", "-", prefix + LOCAL_BUILD_NOTE
+        remote = remote_digest(dict(ref, tag=tag))
         if remote in local:
             return "ok", "same digest", prefix + "up to date (digest matches %s)" % tag
         return "outdated", "new digest", prefix + "newer image pushed for '%s' - pull and recreate" % tag

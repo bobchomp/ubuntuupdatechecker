@@ -631,7 +631,7 @@ class MainEmailTests(unittest.TestCase):
 
     def test_scheduled_run(self):
         rc, send, _ = self.run_main([], env={"INVOCATION_ID": "abc"})
-        self.assertIn("Scheduled run (update-checker.service)", send.call_args.args[5])
+        self.assertIn("Scheduled run (every 3 days at 07:00 UK time)", send.call_args.args[5])
 
     def test_missing_key_prints_report_once(self):
         rc, send, printed = self.run_main(["--dry-run"], secrets="")
@@ -691,6 +691,139 @@ class DockerHelperTests(unittest.TestCase):
             mock.Mock(side_effect=AssertionError("no lookup")), None)
         self.assertEqual(status, "not_checked")
         self.assertIn("built locally", note)
+
+
+# ---------------------------------------------------------------- Schedule
+
+UTC = __import__("datetime").timezone.utc
+dt = __import__("datetime").datetime
+
+
+def london(y, mo, d, h, mi=0):
+    return dt(y, mo, d, h, mi, tzinfo=u.schedule_tz())
+
+
+class ScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "lib", "last-scheduled-report")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_report_days_are_shared_and_cross_month_ends(self):
+        self.assertEqual(u.latest_slot(london(2026, 1, 4, 6, 59)), london(2026, 1, 1, 7))
+        self.assertEqual(u.latest_slot(london(2026, 1, 4, 7, 0)), london(2026, 1, 4, 7))
+        self.assertEqual(u.latest_slot(london(2026, 1, 5, 23, 0)), london(2026, 1, 4, 7))
+        # 31 Jan is a report day; the next one is 3 days later, in February
+        self.assertEqual(u.next_slot(london(2026, 1, 31, 8)), london(2026, 2, 3, 7))
+        # the same moment seen from a UTC machine (the droplet) gives the same slot
+        self.assertEqual(u.latest_slot(london(2026, 11, 6, 9).astimezone(UTC)), london(2026, 11, 6, 7))
+
+    def test_uk_time_follows_daylight_saving(self):
+        summer = u.slot_at(__import__("datetime").date(2026, 6, 30))
+        winter = u.slot_at(__import__("datetime").date(2026, 11, 3))
+        self.assertEqual(summer.astimezone(UTC).hour, 6)    # 07:00 BST
+        self.assertEqual(winter.astimezone(UTC).hour, 7)    # 07:00 GMT
+        # every slot is exactly 3 calendar days apart, also across the clock change
+        slot = london(2026, 3, 23, 7)
+        for _ in range(4):
+            nxt = u.next_slot(slot)
+            self.assertEqual((nxt.date() - slot.date()).days, 3)
+            self.assertEqual((nxt.hour, nxt.minute), (7, 0))
+            slot = nxt
+
+    def test_due_logic(self):
+        slot = london(2026, 1, 4, 7)
+        u.write_last_report(london(2026, 1, 1, 7), self.state)
+        self.assertEqual(u.scheduled_report_due(slot + td(minutes=1), self.state), (True, slot, ""))
+        due, _, note = u.scheduled_report_due(slot + td(hours=5), self.state)
+        self.assertTrue(due)
+        self.assertIn("catch-up", note)
+        u.write_last_report(slot, self.state)
+        due, _, note = u.scheduled_report_due(slot + td(days=1), self.state)
+        self.assertFalse(due)
+        self.assertIn("next report Wed 07 Jan 2026 07:00", note)
+
+    def test_first_run_without_state(self):
+        slot = london(2026, 1, 4, 7)
+        # the scheduled 07:00 run itself goes ahead
+        self.assertTrue(u.scheduled_report_due(slot + td(minutes=2), self.state)[0])
+        self.assertIsNone(u.read_last_report(self.state))
+        # any other time just starts the schedule, no off-schedule report
+        due, _, note = u.scheduled_report_due(slot + td(days=1), self.state)
+        self.assertFalse(due)
+        self.assertEqual(u.read_last_report(self.state), slot)
+        self.assertIn("first report", note)
+
+    def test_show_schedule_starts_it(self):
+        with mock.patch("sys.stdout") as out:
+            u.show_schedule(london(2026, 1, 5, 12), self.state)
+        printed = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertIn("every 3 days at 07:00 UK time", printed)
+        self.assertIn("Next report:        Wed 07 Jan 2026 07:00 GMT", printed)
+        self.assertEqual(u.read_last_report(self.state), london(2026, 1, 4, 7))
+
+    def run_scheduled(self, now, send=None, cfg_text="[general]\nrecipient = a@b.c\n", up_to_date=False):
+        res = u.CheckResult("apt", "x")
+        if not up_to_date:
+            res.subject = ["1 update"]
+        with tempfile.TemporaryDirectory() as d:
+            conf, sec = os.path.join(d, "c"), os.path.join(d, "s")
+            open(conf, "w").write(cfg_text)
+            open(sec, "w").write("RESEND_API_KEY=re_k\n")
+            fake_dt = mock.Mock(wraps=u.datetime.datetime)
+            fake_dt.now = mock.Mock(return_value=now)
+            with mock.patch.object(u, "STATE_FILE", self.state), \
+                    mock.patch.object(u.datetime, "datetime", fake_dt), \
+                    mock.patch.object(u, "run_checks", return_value=[res]) as checks, \
+                    mock.patch.object(u, "send_resend", send or mock.Mock(return_value="id")) as sender, \
+                    mock.patch.object(u, "now_str", return_value="now"), \
+                    mock.patch.dict(os.environ, {"INVOCATION_ID": "x"}, clear=True), \
+                    mock.patch("sys.stdout"):
+                rc = u.main(["--scheduled", "--config", conf, "--secrets", sec])
+        return rc, checks, sender
+
+    def test_scheduled_main(self):
+        slot = london(2026, 1, 4, 7)
+        u.write_last_report(london(2026, 1, 1, 7), self.state)
+        # not a report day: nothing runs, nothing is sent
+        rc, checks, sender = self.run_scheduled(london(2026, 1, 3, 7, 0, ).astimezone(UTC))
+        self.assertEqual(rc, 0)
+        checks.assert_not_called()
+        sender.assert_not_called()
+        # failed send: not recorded, so the next daily trigger retries it
+        rc, checks, sender = self.run_scheduled(slot, send=mock.Mock(side_effect=RuntimeError("HTTP 500")))
+        self.assertEqual(rc, 1)
+        self.assertEqual(u.read_last_report(self.state), london(2026, 1, 1, 7))
+        # retried the next morning as a catch-up, then recorded
+        rc, checks, sender = self.run_scheduled(slot + td(days=1))
+        self.assertEqual(rc, 0)
+        self.assertIn("catch-up for the Sun 04 Jan 2026 07:00 GMT report", sender.call_args.args[5])
+        self.assertEqual(u.read_last_report(self.state), slot)
+        # only once per slot
+        rc, checks, sender = self.run_scheduled(slot + td(days=1, minutes=5))
+        sender.assert_not_called()
+
+    def test_scheduled_skip_when_up_to_date_is_recorded(self):
+        u.write_last_report(london(2026, 1, 1, 7), self.state)
+        rc, _, sender = self.run_scheduled(london(2026, 1, 4, 7), up_to_date=True,
+                                           cfg_text="[general]\nrecipient = a@b.c\nsend_when_up_to_date = no\n")
+        sender.assert_not_called()
+        self.assertEqual(u.read_last_report(self.state), london(2026, 1, 4, 7))
+
+    def test_timer_matches_code(self):
+        timer = open(os.path.join(ROOT, "systemd", "update-checker.timer")).read()
+        service = open(os.path.join(ROOT, "systemd", "update-checker.service")).read()
+        self.assertIn("OnCalendar=*-*-* %02d:%02d:00 %s" % (u.SCHEDULE_TIME + (u.SCHEDULE_TZ,)), timer)
+        self.assertIn("Persistent=true", timer)
+        for drift in ("OnBootSec", "OnUnitActiveSec", "RandomizedDelaySec", "OnActiveSec"):
+            self.assertNotIn(drift + "=", timer)
+        self.assertIn("ExecStart=/usr/local/sbin/update-checker --scheduled", service)
+
+
+def td(**kw):
+    return __import__("datetime").timedelta(**kw)
 
 
 class EmailTests(unittest.TestCase):

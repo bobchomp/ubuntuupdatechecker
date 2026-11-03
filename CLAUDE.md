@@ -36,14 +36,23 @@ PATH when the environment has no systemd.
   Programs are only ever run with a command that prints their version. Never
   guess arguments that might start a daemon: the generic guess is
   `--version` only, and `KNOWN_APPS` entries use verified version commands.
-- **Python 3 standard library only.** No pip packages. One script,
-  `update_checker.py`, installed as `/usr/local/sbin/update-checker`.
+- **Python 3.9+ standard library only** (`zoneinfo` is used for UK time).
+  No pip packages. One script, `update_checker.py`, installed as
+  `/usr/local/sbin/update-checker`.
 - **A failing check must not stop the run.** Raise from a check and
   `run_checks` turns it into an error section, or record per-item errors in
   the check's own table.
 - **Every run emails the report**, scheduled or started by a command
   (`--dry-run` prints and emails). `--no-email` is the only print-only mode.
   `send_when_up_to_date` (default yes) is the only other way to skip an email.
+  The daily timer trigger (`--scheduled`) is not a run unless a report is due.
+- **One shared schedule for every machine, defined in code:**
+  `SCHEDULE_*` in `update_checker.py` (every 3 days at 07:00 Europe/London,
+  on days counted from `SCHEDULE_START`). `systemd/update-checker.timer` fires
+  daily at that time with `Persistent=true` for catch-ups. Keep them in step
+  (a test checks this). Never add per-machine timing (`OnBootSec`,
+  `OnUnitActiveSec`, `RandomizedDelaySec`) or per-machine schedule config. A
+  schedule change is made in the repo and installed on every machine.
 - Per-machine behaviour lives in `/etc/update-checker/config` (INI). Keep
   `config/config.example` and `examples/*.conf` in sync with new options, and
   make new options default sensibly so existing configs keep working.

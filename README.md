@@ -1,8 +1,9 @@
 # update-checker
 
-A lightweight, **report-only** update checker for Ubuntu Server. Every 3 days it
-checks the machine and emails one HTML report through the
-[Resend](https://resend.com) HTTPS API (no SMTP, so it works on DigitalOcean).
+A lightweight, **report-only** update checker for Ubuntu Server. Every 3 days
+at **07:00 UK time**, all machines check themselves at the same moment and each
+emails one HTML report through the [Resend](https://resend.com) HTTPS API (no
+SMTP, so it works on DigitalOcean).
 
 It **never installs, upgrades, restarts or removes anything**. The only command
 it runs that changes state is `apt-get update`, which refreshes the package lists.
@@ -87,7 +88,10 @@ The installer:
    the repo or printed;
 4. installs and starts `update-checker.timer` (systemd, runs as root).
 
-The first report is emailed a few minutes after install, then every 3 days.
+Reports then arrive on the [shared schedule](#changing-the-schedule): every 3 days
+at 07:00 UK time, on the same days for every machine. The installer prints
+when the first one is due. For a report straight away, run
+`sudo update-checker --dry-run`.
 
 Re-running `install.sh` (e.g. after a `git pull`) updates the script and the
 systemd units but **keeps your existing config and API key**. (If that config
@@ -362,18 +366,19 @@ so it isn't mistaken for a full report.
 
 ## Running a check manually
 
-All of these email the report:
+Both of these run every check straight away and email the report:
 
 ```bash
 sudo update-checker --dry-run                 # prints it here too
 sudo update-checker                           # prints only the log lines
-sudo systemctl start update-checker.service   # exactly as the timer runs it
-journalctl -u update-checker.service -n 50 --no-pager
 ```
 
-Scheduled runs and `systemctl start` are labelled "Scheduled run" in the
-email. Runs from the command line are labelled "Started by command" and show
-the command.
+The email says "Started by command" and shows the command. Scheduled reports
+say "Scheduled run" (and "catch-up" if the machine was off at the time).
+
+`sudo systemctl start update-checker.service` does what the timer does: it
+sends a report only if one is due on the shared schedule, otherwise it logs
+"No report due" and does nothing.
 
 Run it with `sudo`: the API key file is readable by root only, so without
 `sudo` the email can't be sent (the report is still printed).
@@ -393,7 +398,8 @@ journalctl -u update-checker.service -n 100          # last 100 lines
 journalctl -u update-checker.service --since today
 journalctl -u update-checker.service -f              # follow a run live
 systemctl status update-checker.service              # result of the last run
-systemctl list-timers update-checker.timer           # when it last ran / runs next
+systemctl list-timers update-checker.timer           # next daily 07:00 trigger
+update-checker --schedule                            # last and next report
 ```
 
 Each run logs every check's result and the subject line, then
@@ -403,56 +409,52 @@ Each run logs every check's result and the subject line, then
 
 ## Changing the schedule
 
-The timer (`/etc/systemd/system/update-checker.timer`) is:
+All machines follow one schedule, set in the code so it's the same
+everywhere:
 
-```ini
-[Timer]
-OnUnitActiveSec=3d      # every 3 days, counted from the last run
-Persistent=true
-OnBootSec=15min         # run 15 min after boot
-RandomizedDelaySec=5min
-```
+- **Every 3 days at 07:00 UK time** (Europe/London, so it follows GMT/BST).
+  Machines whose clock is on UTC, like DigitalOcean droplets, still run at
+  07:00 UK time.
+- **The same days on every machine:** report days are counted from a fixed
+  start date (1 Jan 2026), not from install or reboot, so they don't drift
+  and month ends don't break the pattern.
+- **Missed reports are caught up:** if a machine is off or rebooting at
+  07:00 on a report day, it sends that report once when it starts up (marked
+  "catch-up"), then carries on with the shared days. A report whose email
+  failed is retried the next morning.
+- **No other automatic runs:** installing or rebooting doesn't send a
+  report. Run `sudo update-checker --dry-run` whenever you want one.
 
-A note on catching up missed runs: systemd only applies `Persistent=true` to
-`OnCalendar=` timers. With `OnUnitActiveSec=` the 3-day countdown restarts when
-the machine boots, so `OnBootSec=15min` is what makes sure a report is sent
-after the machine has been off. It also means a reboot triggers a report, and
-the countdown starts again from there.
-
-To change it, use a drop-in override (survives re-running `install.sh`):
-
-```bash
-sudo systemctl edit update-checker.timer
-```
-
-and put, for example:
-
-```ini
-[Timer]
-OnUnitActiveSec=
-OnUnitActiveSec=1d
-```
-
-(the empty line clears the original value). Or switch to fixed calendar times,
-where `Persistent=true` does catch up missed runs:
-
-```ini
-[Timer]
-OnUnitActiveSec=
-OnBootSec=
-OnCalendar=Mon,Thu 08:00
-Persistent=true
-```
-
-Then:
+See where a machine is:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart update-checker.timer
-systemctl list-timers update-checker.timer
+update-checker --schedule
 ```
 
-Remove the override with `sudo systemctl revert update-checker.timer`.
+```
+Schedule:           every 3 days at 07:00 UK time (same on every machine)
+Last report slot:   Tue 03 Nov 2026 07:00 GMT
+Next report:        Fri 06 Nov 2026 07:00 GMT
+```
+
+How it works: the systemd timer fires every day at 07:00 UK time
+(`OnCalendar=*-*-* 07:00:00 Europe/London`, `Persistent=true` for catch-ups)
+and runs `update-checker --scheduled`. That sends a report only on a shared
+report day, recording the last report in `/var/lib/update-checker/`.
+
+### Changing it for all machines
+
+Change it in the repository, not on one machine, so every machine stays in
+step:
+
+1. Edit `SCHEDULE_TIME`, `SCHEDULE_INTERVAL_DAYS`, `SCHEDULE_TZ` and/or
+   `SCHEDULE_START` at the top of `update_checker.py`.
+2. If you changed the time or timezone, change `OnCalendar=` in
+   `systemd/update-checker.timer` to match (the tests fail if they differ).
+3. Push, then `git pull && sudo ./install.sh` on every machine.
+
+Avoid per-machine timer overrides (`systemctl edit update-checker.timer`):
+they take that machine off the shared schedule.
 
 ---
 
@@ -476,6 +478,7 @@ Stops and removes the timer and service, the script and `/usr/local/share/update
 | `/etc/update-checker/config` | per-machine config |
 | `/etc/update-checker/secret.env` | `RESEND_API_KEY`, optional `GITHUB_TOKEN`. root:root, 600 |
 | `/etc/systemd/system/update-checker.{service,timer}` | systemd units |
+| `/var/lib/update-checker/last-scheduled-report` | when the last scheduled report was sent (for catch-ups) |
 | `/usr/local/share/update-checker/` | config template and machine examples, for reference |
 
 | Path (repo) | |

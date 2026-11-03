@@ -34,6 +34,7 @@ systemctl reset-failed update-checker.service update-checker.timer >/dev/null 2>
 info "Removing program files"
 rm -f /usr/local/sbin/update-checker
 rm -rf /usr/local/share/update-checker
+rm -rf /var/lib/update-checker
 
 if [ -d "$CONF_DIR" ]; then
     if [ "$PURGE" = ask ]; then

@@ -1,16 +1,17 @@
 [Unit]
-Description=Run update-checker every 3 days
+Description=update-checker shared schedule (daily trigger at 07:00 UK time)
 
 [Timer]
-# Every 3 days, counted from the last run.
-OnUnitActiveSec=3d
-# Note: systemd only honours Persistent= for OnCalendar= timers. The
-# monotonic counter above restarts at boot, so OnBootSec= is what makes a
-# run happen after the machine has been off (and shortly after install,
-# because the boot time has already passed when the timer is first started).
+# Every machine fires at the same moment: 07:00 UK time, whatever the
+# machine's own timezone (DigitalOcean droplets default to UTC). The script
+# (--scheduled) sends a report only on the shared report days, every 3 days.
+# Keep in step with SCHEDULE_* in update_checker.py; a test checks this.
+OnCalendar=*-*-* 07:00:00 Europe/London
+# If the machine was off at 07:00, run once when it starts up again, so a
+# missed report is sent late rather than skipped.
 Persistent=true
-OnBootSec=15min
-RandomizedDelaySec=5min
+# Start on time; systemd would otherwise allow up to a minute of slack.
+AccuracySec=1s
 Unit=update-checker.service
 
 [Install]

@@ -37,8 +37,10 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "run as root: sudo $0"
 command -v python3 >/dev/null || die "python3 is required (sudo apt install python3)"
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
-    || die "python3 3.8 or newer is required"
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
+    || die "python3 3.9 or newer is required (Ubuntu 22.04 or later)"
+python3 -c 'import zoneinfo; zoneinfo.ZoneInfo("Europe/London")' 2>/dev/null \
+    || die "timezone data is missing (sudo apt install tzdata)"
 command -v systemctl >/dev/null || die "systemd is required"
 for f in update_checker.py config/config.example config/secret.env.example \
          systemd/update-checker.service systemd/update-checker.timer; do
@@ -202,15 +204,19 @@ systemctl restart update-checker.timer
 
 echo
 info "Installed."
-systemctl list-timers update-checker.timer --no-pager 2>/dev/null | head -n 3 || true
+echo
+# Starts the shared schedule on first install (so no report is sent until
+# the next shared report time) and shows when that is.
+"$BIN" --schedule
 cat <<EOF
 
   Config:       $CONF
   Secrets:      $SECRET
   Run now:      sudo update-checker --dry-run   (prints the report here and emails it)
   Preview only: sudo update-checker --no-email  (prints it, no email)
+  Schedule:     update-checker --schedule
   Logs:         journalctl -u update-checker.service
 
-The first report is emailed within a few minutes (follow it with:
-journalctl -u update-checker.service -f), then every 3 days.
+Reports are emailed on the same schedule on every machine. For one now, run
+sudo update-checker --dry-run
 EOF

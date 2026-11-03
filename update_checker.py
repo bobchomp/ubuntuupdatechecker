@@ -28,9 +28,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_CONFIG = "/etc/update-checker/config"
 DEFAULT_SECRETS = "/etc/update-checker/secret.env"
+STATE_FILE = "/var/lib/update-checker/last-scheduled-report"
+
+# The shared schedule, the same on every machine: a report every
+# SCHEDULE_INTERVAL_DAYS days at SCHEDULE_TIME in SCHEDULE_TZ, on the days
+# counted from SCHEDULE_START. systemd/update-checker.timer fires daily at
+# that time (a test checks they match) and `--scheduled` decides whether a
+# report is due.
+SCHEDULE_TZ = "Europe/London"
+SCHEDULE_TIME = (7, 0)
+SCHEDULE_INTERVAL_DAYS = 3
+SCHEDULE_START = datetime.date(2026, 1, 1)
 USER_AGENT = "update-checker/%s (+https://github.com/bobchomp/ubuntuupdatechecker)" % VERSION
 HTTP_TIMEOUT = 20
 
@@ -282,7 +293,7 @@ def run_origin(argv=None):
     """Describe how this run was started. systemd sets INVOCATION_ID for
     service runs (the timer, or `systemctl start update-checker`)."""
     if os.environ.get("INVOCATION_ID"):
-        return "Scheduled run (update-checker.service)"
+        return "Scheduled run (%s)" % describe_schedule()
     args = sys.argv[1:] if argv is None else argv
     return "Started by command: update-checker %s" % " ".join(shlex.quote(a) for a in args)
 
@@ -1653,6 +1664,94 @@ def evaluate_container(cfg, ref, img, source, sources, remote_digest, remote_tag
 
 
 # --------------------------------------------------------------------------
+# Shared schedule
+# --------------------------------------------------------------------------
+
+def schedule_tz():
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    return ZoneInfo(SCHEDULE_TZ)
+
+
+def slot_at(day):
+    return datetime.datetime(day.year, day.month, day.day, *SCHEDULE_TIME, tzinfo=schedule_tz())
+
+
+def latest_slot(now):
+    """The most recent scheduled report time at or before `now` (aware)."""
+    local = now.astimezone(schedule_tz())
+    day = local.date()
+    if (local.hour, local.minute) < SCHEDULE_TIME:
+        day -= datetime.timedelta(days=1)
+    day -= datetime.timedelta(days=(day - SCHEDULE_START).days % SCHEDULE_INTERVAL_DAYS)
+    return slot_at(day)
+
+
+def next_slot(now):
+    return slot_at(latest_slot(now).date() + datetime.timedelta(days=SCHEDULE_INTERVAL_DAYS))
+
+
+def describe_schedule():
+    return "every %d days at %02d:%02d UK time" % ((SCHEDULE_INTERVAL_DAYS,) + SCHEDULE_TIME) \
+        if SCHEDULE_TZ == "Europe/London" else "every %d days at %02d:%02d %s" % (
+            (SCHEDULE_INTERVAL_DAYS,) + SCHEDULE_TIME + (SCHEDULE_TZ,))
+
+
+def fmt_slot(dt):
+    return dt.astimezone(schedule_tz()).strftime("%a %d %b %Y %H:%M %Z")
+
+
+def read_last_report(path=None):
+    try:
+        with open(path or STATE_FILE, encoding="utf-8") as fh:
+            return datetime.datetime.fromisoformat(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_last_report(slot, path=None):
+    path = path or STATE_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(slot.isoformat() + "\n")
+    os.replace(tmp, path)
+
+
+def scheduled_report_due(now, path=None):
+    """Return (due, slot, note). Only one report per scheduled slot: a
+    machine that was off sends the missed one when it's back (systemd's
+    Persistent= re-runs the missed daily trigger at boot)."""
+    slot = latest_slot(now)
+    last = read_last_report(path)
+    if last is None:
+        # Not initialised (install.sh runs --schedule to do this). Only report
+        # if this run is the scheduled one itself, not some later catch-up.
+        if now - slot < datetime.timedelta(hours=1):
+            return True, slot, ""
+        write_last_report(slot, path)
+        return False, slot, "schedule started; first report %s" % fmt_slot(next_slot(now))
+    if last >= slot:
+        return False, slot, "not a report day; next report %s" % fmt_slot(next_slot(now))
+    late = now - slot >= datetime.timedelta(minutes=30)
+    return True, slot, ("catch-up for the %s report (the machine was off)" % fmt_slot(slot)) if late else ""
+
+
+def show_schedule(now, path=None):
+    """Print the schedule. On first use (install.sh), start it: the first
+    report is then the next shared slot, not one straight away."""
+    last = read_last_report(path)
+    if last is None:
+        try:
+            write_last_report(latest_slot(now), path)
+            last = read_last_report(path)
+        except OSError as exc:
+            log("could not start the schedule (%s) - run with sudo" % exc)
+    print("Schedule:           %s (same on every machine)" % describe_schedule())
+    print("Last report slot:   %s" % (fmt_slot(last) if last else "none yet"))
+    print("Next report:        %s" % fmt_slot(next_slot(now)))
+
+
+# --------------------------------------------------------------------------
 # Email
 # --------------------------------------------------------------------------
 
@@ -1743,8 +1842,24 @@ def main(argv=None):
     p.add_argument("--html", metavar="FILE", help="also write the HTML report to FILE")
     p.add_argument("--skip-apt-update", action="store_true",
                    help="don't run 'apt-get update' (use the existing package lists)")
+    p.add_argument("--scheduled", action="store_true",
+                   help="used by the systemd timer: only run if a scheduled report is due")
+    p.add_argument("--schedule", action="store_true",
+                   help="show the shared schedule and when the next report is due")
     p.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = p.parse_args(argv)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if args.schedule:
+        show_schedule(now)
+        return 0
+    slot, catch_up = None, ""
+    if args.scheduled:
+        due, slot, note = scheduled_report_due(now)
+        if not due:
+            log("No report due: %s" % note)
+            return 0
+        catch_up = note
 
     if args.only:
         bad = set(split_list(args.only)) - set(CHECK_ORDER)
@@ -1760,6 +1875,8 @@ def main(argv=None):
     only = [c for c in CHECK_ORDER if c in split_list(args.only)] if args.only else None
     subject, up_to_date = build_subject(cfg.label, results, only)
     origin = run_origin(argv)
+    if catch_up:
+        origin += " - " + catch_up
     text_body = render_text(cfg.label, results, subject, origin)
     html_body = render_html(cfg.label, results, subject, origin)
 
@@ -1781,6 +1898,8 @@ def main(argv=None):
     log(subject)
     if up_to_date and not cfg.send_when_up_to_date:
         log("Everything up to date and send_when_up_to_date = no; not sending email.")
+        if slot:
+            write_last_report(slot)
         return 0
     api_key = secrets.get("RESEND_API_KEY", "")
     if not api_key or api_key.startswith("re_xxxx"):
@@ -1803,6 +1922,8 @@ def main(argv=None):
             sys.stdout.write(text_body)  # keep the report in the journal
         return 1
     log("Email sent to %s (id %s)" % (", ".join(cfg.recipients), msg_id))
+    if slot:
+        write_last_report(slot)   # only once it's sent, so a failed send is retried
     return 0
 
 
